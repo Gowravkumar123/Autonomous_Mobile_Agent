@@ -1,0 +1,20 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+backend/.env
+backend/audit_logs/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.iml
+android/gradle/wrapper/gradle-wrapper.jar
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
