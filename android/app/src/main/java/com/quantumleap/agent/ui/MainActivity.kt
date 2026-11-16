@@ -104,11 +104,14 @@ class MainActivity : AppCompatActivity() {
             .toRequestBody("application/json".toMediaType())
         val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/tasks").post(body).build()
         http.newCall(req).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) =
+            override fun onFailure(call: Call, e: IOException) {
                 ui.post { toast("Could not reach backend: ${e.message}") }
+            }
 
-            override fun onResponse(call: Call, response: Response) =
+            override fun onResponse(call: Call, response: Response) {
+                response.close()
                 ui.post { toast("Task started") }
+            }
         })
     }
 
