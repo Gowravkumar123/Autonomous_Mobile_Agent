@@ -73,11 +73,24 @@ class AgentAccessibilityService : AccessibilityService(), AgentWebSocketClient.H
     }
 
     private val screenshotExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var lastShotMs = 0L
 
     /** Take a screenshot of the current screen as a downscaled JPEG (base64), for the
-     *  vision model. Returns null if unavailable (API < 30) or on failure. */
+     *  vision model. The accessibility screenshot API is rate-limited (~1/sec), so we
+     *  throttle and retry — a null here previously got mis-read as a "secure" screen. */
     private fun captureScreenshotB64(): String? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        repeat(3) {
+            val since = System.currentTimeMillis() - lastShotMs
+            if (since in 0 until 850) try { Thread.sleep(850 - since) } catch (_: InterruptedException) {}
+            val shot = captureOnce()
+            lastShotMs = System.currentTimeMillis()
+            if (shot != null) return shot
+        }
+        return null
+    }
+
+    private fun captureOnce(): String? {
         val latch = CountDownLatch(1)
         var out: String? = null
         try {
@@ -109,7 +122,7 @@ class AgentAccessibilityService : AccessibilityService(), AgentWebSocketClient.H
                         latch.countDown()
                     }
                 })
-            latch.await(2, TimeUnit.SECONDS)
+            latch.await(3, TimeUnit.SECONDS)
         } catch (e: Exception) {
             Log.w(TAG, "takeScreenshot threw", e)
         }
