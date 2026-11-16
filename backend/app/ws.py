@@ -26,7 +26,10 @@ class DeviceSession:
 
     async def _send(self, msg: dict[str, Any]) -> None:
         async with self._send_lock:
-            await self.socket.send_json(msg)
+            try:
+                await self.socket.send_json(msg)
+            except Exception as e:  # socket closed mid-send -> normalise to RuntimeError
+                raise RuntimeError(f"device send failed: {type(e).__name__}") from e
 
     async def request(self, type_: str, timeout: float = 60.0, **data: Any) -> dict:
         """Send a request and await the device's matching response payload."""

@@ -108,7 +108,8 @@ class AgentController:
         task.set_state(TaskState.RUNNING)
         self._emit(task)
 
-        blind = 0   # consecutive screens with neither a tree nor a screenshot (secure/loading)
+        blind = 0        # consecutive screens with neither a tree nor a screenshot (secure/loading)
+        disconnects = 0  # consecutive device disconnects (OEM battery kills); we wait and retry
         for step in range(MAX_STEPS):
             if task.cancel_requested:
                 task.set_state(TaskState.CANCELLED, "cancelled by user")
@@ -122,12 +123,19 @@ class AgentController:
                 task.set_state(TaskState.FAILED, "device disconnected and did not return")
                 break
 
-            # ---- observe ----
+            # ---- observe ---- (survive a transient disconnect: wait and retry the step)
             try:
                 screen = await self._observe(device)
-            except (LLMError, asyncio.TimeoutError, RuntimeError, OSError) as e:
-                task.set_state(TaskState.FAILED, f"lost the device: {e}")
-                break
+            except (asyncio.TimeoutError, RuntimeError, OSError) as e:
+                disconnects += 1
+                if disconnects > 6:
+                    task.set_state(TaskState.FAILED, f"device kept disconnecting: {e}")
+                    break
+                task.log("note", f"disconnect {disconnects}; waiting to resume ({e})")
+                self.store.publish(task.id, "note", f"reconnecting ({disconnects})")
+                await asyncio.sleep(2.0)
+                continue
+            disconnects = 0
             task.step_id = step
             self.store.publish(task.id, "observation", screen.activity,
                                app=screen.app_package, n_elements=len(screen.elements))
@@ -286,7 +294,18 @@ class AgentController:
                            thought=str(last_err))
 
     async def _act(self, device: DeviceSession, action: AgentAction, task: Task) -> None:
-        await device.request("act", action=action.model_dump(mode="json"))
+        payload = action.model_dump(mode="json")
+        for attempt in range(2):
+            try:
+                await device.request("act", action=payload)
+                break
+            except (RuntimeError, OSError, asyncio.TimeoutError):
+                if attempt == 1:
+                    raise
+                fresh = await self._await_device(task)   # reconnected session, if any
+                if fresh is None:
+                    raise
+                device = fresh
         label = self._action_label(action)
         task.history.append(label)
         self.store.publish(task.id, "action", label, risk=action.risk_level)
