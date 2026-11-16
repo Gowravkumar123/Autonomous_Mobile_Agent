@@ -129,7 +129,7 @@ class AgentController:
                                app=screen.app_package, n_elements=len(screen.elements))
 
             # ---- verify success first (a confirmation may already be on screen) ----
-            if is_success(screen, skill):
+            if is_success(screen, skill, task):
                 task.summary = self._summarize(task, success=True)
                 task.set_state(TaskState.COMPLETED, "success marker verified")
                 audit(task.id, "verified", task.summary)
@@ -142,7 +142,7 @@ class AgentController:
 
             if action.type == ActionType.DONE:
                 # Model claims done but no marker — be honest about uncertainty.
-                verified = is_success(screen, skill)
+                verified = is_success(screen, skill, task)
                 task.summary = self._summarize(task, success=verified)
                 task.set_state(TaskState.COMPLETED if verified else TaskState.WAITING_FOR_USER,
                                "model reported done" + ("" if verified else " (unverified — please confirm)"))
@@ -169,6 +169,7 @@ class AgentController:
                 if task.cancel_requested or not approved:
                     task.set_state(TaskState.CANCELLED, "user declined the sensitive step")
                     break
+                task.approvals_granted += 1
                 task.set_state(TaskState.RUNNING)
                 if decision.risk_level >= 4:
                     # User-only action (payment/auth). The user performs it; we re-observe.

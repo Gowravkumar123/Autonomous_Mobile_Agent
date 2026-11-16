@@ -50,6 +50,7 @@ class Task(BaseModel):
 
     # Runtime.
     step_id: int = 0
+    approvals_granted: int = 0                          # how many sensitive steps the user approved
     history: list[str] = Field(default_factory=list)   # short human-readable action log
     pending_action: Optional[AgentAction] = None       # action awaiting approval
     pending_approval_reason: str = ""

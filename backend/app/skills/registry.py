@@ -29,7 +29,9 @@ register(Skill(
         "if anything is ambiguous or irreversible."
     ),
     approval_boundary="Stop before any payment, submission, or message that leaves the device.",
-    success_markers=["success", "done", "confirmed", "sent"],
+    # Generic tasks have no reliable text marker; rely on the model's own `done`
+    # signal rather than ambient words that cause false positives.
+    success_markers=[],
 ))
 
 register(Skill(
@@ -101,6 +103,12 @@ register(Skill(
         "pre-authorized sending."
     ),
     approval_boundary="Confirm the exact recipient and message text before sending.",
-    success_markers=["sent", "delivered", "message sent"],
+    # No text markers: WhatsApp signals "sent" with icons, and words like "delivered"
+    # are ambient in the chat list. Success = the message text is on screen AND the
+    # send was approved (so it can't false-complete just from opening the app).
+    success_markers=[],
+    success_requires_fact="message",
+    confirm_after_approval=True,
+    min_actions_before_success=3,
     required_facts=["to_contact", "message"],
 ))
