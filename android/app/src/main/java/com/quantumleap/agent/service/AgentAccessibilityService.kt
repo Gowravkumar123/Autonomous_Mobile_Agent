@@ -33,6 +33,9 @@ class AgentAccessibilityService : AccessibilityService(), AgentWebSocketClient.H
     // The most recent approval the user must answer (surfaced to the UI).
     @Volatile var pendingApproval: JSONObject? = null
         private set
+    // The most recent clarifying question the agent asked (answered by voice or text).
+    @Volatile var pendingQuestion: JSONObject? = null
+        private set
     @Volatile var lastStatus: String = "Idle"
         private set
 
@@ -139,7 +142,25 @@ class AgentAccessibilityService : AccessibilityService(), AgentWebSocketClient.H
     override fun onApprovalRequest(request: JSONObject) {
         pendingApproval = request
         lastStatus = "Approval needed: ${request.optString("reason")}"
-        // The UI (MainActivity) observes pendingApproval and shows Approve / Decline.
+        bringUiToFront()   // so the user can hear/answer the approval hands-free
+    }
+
+    override fun onAskUser(request: JSONObject) {
+        pendingQuestion = request
+        val qs = request.optJSONArray("questions")
+        lastStatus = "Agent asks: " + (qs?.optString(0) ?: "needs more info")
+        bringUiToFront()   // MainActivity speaks the question and listens for the answer
+    }
+
+    private fun bringUiToFront() {
+        try {
+            val i = android.content.Intent(this, com.quantumleap.agent.ui.MainActivity::class.java)
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                          android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            startActivity(i)
+        } catch (e: Exception) {
+            Log.w(TAG, "could not bring UI to front", e)
+        }
     }
 
     override fun onStatus(message: JSONObject) {
@@ -153,6 +174,13 @@ class AgentAccessibilityService : AccessibilityService(), AgentWebSocketClient.H
         val req = pendingApproval ?: return
         ws?.sendApprovalResponse(req.optString("task_id"), approved)
         pendingApproval = null
+    }
+
+    /** Answer the agent's clarifying question (from voice or typed text). */
+    fun answerClarification(text: String) {
+        val req = pendingQuestion ?: return
+        ws?.sendAnswer(req.optString("task_id"), text)
+        pendingQuestion = null
     }
 
     /** User finished the payment/auth and wants the agent to continue. */

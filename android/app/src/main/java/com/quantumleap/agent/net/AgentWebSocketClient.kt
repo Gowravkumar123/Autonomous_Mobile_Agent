@@ -28,6 +28,8 @@ class AgentWebSocketClient(
         fun onHandoff(approval: JSONObject): JSONObject
         /** Show the approval UI. The user answers later via [sendApprovalResponse]. */
         fun onApprovalRequest(request: JSONObject)
+        /** The agent asked a clarifying question; answer later via [sendAnswer]. */
+        fun onAskUser(request: JSONObject)
         /** Status / summary pushes for the UI. */
         fun onStatus(message: JSONObject)
     }
@@ -63,6 +65,13 @@ class AgentWebSocketClient(
             .put("note", note))
     }
 
+    fun sendAnswer(taskId: String, answerText: String) {
+        send(JSONObject()
+            .put("type", "answer")
+            .put("task_id", taskId)
+            .put("facts", JSONObject().put("clarification_answer", answerText)))
+    }
+
     private fun open() {
         val request = Request.Builder().url("$wsUrl/ws/device/$deviceId").build()
         socket = client.newWebSocket(request, object : WebSocketListener() {
@@ -94,6 +103,7 @@ class AgentWebSocketClient(
                 "act" -> reply(ws, rid, handler.onAct(msg.optJSONObject("action") ?: JSONObject()))
                 "handoff" -> reply(ws, rid, handler.onHandoff(msg.optJSONObject("approval") ?: JSONObject()))
                 "approval_request" -> handler.onApprovalRequest(msg)
+                "ask_user" -> handler.onAskUser(msg)
                 else -> handler.onStatus(msg)
             }
         } catch (e: Exception) {
