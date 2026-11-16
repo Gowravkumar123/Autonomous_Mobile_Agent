@@ -31,32 +31,6 @@ log = logging.getLogger("agent.controller")
 
 MAX_STEPS = 40
 
-# Friendly app name -> Android package. open_app needs the exact package, but the
-# model usually proposes a name. Extend this as new skills/apps are added.
-APP_PACKAGE_BY_NAME = {
-    "whatsapp": "com.whatsapp",
-    "swiggy": "in.swiggy.android",
-    "zomato": "com.application.zomato",
-    "bookmyshow": "com.bt.bms",
-    "book my show": "com.bt.bms",
-    "pvr": "com.net.pvr",
-    "irctc": "cris.org.in.prs.ima",
-    "rail connect": "cris.org.in.prs.ima",
-    "telegram": "org.telegram.messenger",
-    "messages": "com.google.android.apps.messaging",
-}
-
-
-def resolve_package(text: str, skill) -> str:
-    """Map a friendly app name to its package; fall back to the skill's primary app."""
-    t = (text or "").strip().lower()
-    if t and "." in t and " " not in t:
-        return text  # already a package id
-    for name, pkg in APP_PACKAGE_BY_NAME.items():
-        if name in t:
-            return pkg
-    return skill.primary_app() or text
-
 
 class AgentController:
     def __init__(self, llm: LLMRouter, policy: PolicyEngine, devices: DeviceRegistry,
@@ -192,9 +166,8 @@ class AgentController:
                     self.store.publish(task.id, "note", f"already in {screen.app_package}, skip open")
                     task.history.append(f"(already in {screen.app_package}; skipped open_app)")
                     continue
-                # The launcher needs the exact package, but the model usually gives a
-                # friendly name ("Swiggy"). Translate it, or fall back to the skill app.
-                action.text = resolve_package(action.text, skill)
+                # Pass the app name/package through; the device resolves a friendly
+                # name ("Swiggy") to a package dynamically via the launcher's labels.
                 await self._act(device, action, task)
                 await asyncio.sleep(4.0)   # cold starts need time before the next observe
                 continue

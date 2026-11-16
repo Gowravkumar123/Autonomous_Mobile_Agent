@@ -2,6 +2,7 @@ package com.quantumleap.agent.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.Intent
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Bundle
@@ -83,11 +84,43 @@ class ActionExecutor(private val service: AccessibilityService) {
         return service.dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
     }
 
-    private fun openApp(pkg: String?): Boolean {
-        pkg ?: return false
-        val intent = service.packageManager.getLaunchIntentForPackage(pkg) ?: return false
-        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+    /**
+     * Launch an app given a package id OR a friendly name ("Swiggy"). The name is
+     * resolved dynamically against the launcher's visible app labels, so no hardcoded
+     * name->package table is needed — it works for any installed app on any device.
+     */
+    private fun openApp(nameOrPackage: String?): Boolean {
+        val query = nameOrPackage?.trim().orEmpty()
+        if (query.isEmpty()) return false
+        val pm = service.packageManager
+
+        // 1. Exact package id? launch directly.
+        pm.getLaunchIntentForPackage(query)?.let {
+            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            service.startActivity(it)
+            return true
+        }
+
+        // 2. Resolve by visible app label.
+        val pkg = findPackageByLabel(query) ?: return false
+        val intent = pm.getLaunchIntentForPackage(pkg) ?: return false
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         service.startActivity(intent)
         return true
+    }
+
+    private fun findPackageByLabel(name: String): String? {
+        val pm = service.packageManager
+        val q = name.lowercase()
+        val launchables = pm.queryIntentActivities(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+        var partial: String? = null
+        for (ri in launchables) {
+            val label = ri.loadLabel(pm).toString().lowercase()
+            val pkg = ri.activityInfo.packageName
+            if (label == q) return pkg                       // exact label match wins
+            if (partial == null && (label.contains(q) || q.contains(label))) partial = pkg
+        }
+        return partial
     }
 }
