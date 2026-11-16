@@ -45,6 +45,7 @@ class AgentAccessibilityService : AccessibilityService(), AgentWebSocketClient.H
         executor = ActionExecutor(this)
         val deviceId = "android-${android.os.Build.MODEL}".replace(" ", "-")
         ws = AgentWebSocketClient(BuildConfig.BACKEND_WS_URL, deviceId, this).also { it.connect() }
+        AgentForegroundService.keepAlive(this)   // keep the process alive + enable background voice
         lastStatus = "Connected. Waiting for a task."
         Log.i(TAG, "service connected, device=$deviceId")
     }
@@ -142,25 +143,17 @@ class AgentAccessibilityService : AccessibilityService(), AgentWebSocketClient.H
     override fun onApprovalRequest(request: JSONObject) {
         pendingApproval = request
         lastStatus = "Approval needed: ${request.optString("reason")}"
-        bringUiToFront()   // so the user can hear/answer the approval hands-free
+        // Ask by voice in the background — the UI is NOT brought to the front.
+        val spoken = request.optString("title") + ". " + request.optString("summary")
+        AgentForegroundService.requestApproval(this, spoken)
     }
 
     override fun onAskUser(request: JSONObject) {
         pendingQuestion = request
-        val qs = request.optJSONArray("questions")
-        lastStatus = "Agent asks: " + (qs?.optString(0) ?: "needs more info")
-        bringUiToFront()   // MainActivity speaks the question and listens for the answer
-    }
-
-    private fun bringUiToFront() {
-        try {
-            val i = android.content.Intent(this, com.quantumleap.agent.ui.MainActivity::class.java)
-                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
-                          android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-            startActivity(i)
-        } catch (e: Exception) {
-            Log.w(TAG, "could not bring UI to front", e)
-        }
+        val q = request.optJSONArray("questions")?.optString(0) ?: "I need more information."
+        lastStatus = "Agent asks: $q"
+        // Speak the question and listen for the answer in the background.
+        AgentForegroundService.askUser(this, q)
     }
 
     override fun onStatus(message: JSONObject) {

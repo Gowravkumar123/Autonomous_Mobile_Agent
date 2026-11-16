@@ -135,31 +135,10 @@ class MainActivity : AppCompatActivity() {
             override fun run() {
                 val svc = AgentAccessibilityService.instance
                 status.text = "Status: " + (svc?.lastStatus ?: "controller not enabled")
-                render(svc)
-                handleVoiceQuestion(svc)
+                render(svc)   // voice Q&A is handled by AgentForegroundService in the background
                 ui.postDelayed(this, 1000)
             }
         })
-    }
-
-    /** When the agent asks something, speak it and listen for the spoken answer. */
-    private fun handleVoiceQuestion(svc: AgentAccessibilityService?) {
-        val q = svc?.pendingQuestion
-        if (q == null) { handlingQuestionFor = null; return }
-        val taskId = q.optString("task_id")
-        if (taskId == handlingQuestionFor || voiceBusy) return
-        handlingQuestionFor = taskId
-        val question = q.optJSONArray("questions")?.optString(0) ?: "I need more information."
-        speakThen(question) {
-            if (!hasMic()) { toast("Grant mic permission to answer by voice"); return@speakThen }
-            listen(
-                onResult = { answer ->
-                    svc.answerClarification(answer)
-                    speak("Okay, continuing.")
-                    ui.postDelayed({ moveTaskToBack(true) }, 500)  // return to the target app
-                },
-                onError = { toast("Didn't catch the answer — you can type it below") })
-        }
     }
 
     private fun render(svc: AgentAccessibilityService?) {
