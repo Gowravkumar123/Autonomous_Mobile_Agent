@@ -86,16 +86,24 @@ ACTION_SYSTEM = (
 
 
 def build_action_user(goal: str, facts: dict, plan_summary: str,
-                      history: list[str], screen: ScreenObservation) -> str:
+                      history: list[str], screen: ScreenObservation,
+                      max_elements: int = 70, max_text: int = 70) -> str:
+    def clip(s: str) -> str:
+        s = s or ""
+        return s[:max_text] + "…" if len(s) > max_text else s
+
+    shown = screen.elements[:max_elements]
     elements = [
         {
-            "ref": e.ref, "role": e.role, "text": e.text, "desc": e.desc,
+            "ref": e.ref, "role": e.role, "text": clip(e.text), "desc": clip(e.desc),
             "resource_id": e.resource_id, "editable": e.editable,
             "clickable": e.clickable, "scrollable": e.scrollable,
             "checked": e.checked, "enabled": e.enabled,
         }
-        for e in screen.elements
+        for e in shown
     ]
+    more = "" if len(screen.elements) <= max_elements else \
+        f"\n(+{len(screen.elements) - max_elements} more elements not shown — scroll if needed)"
     hist = "\n".join(f"  {h}" for h in history[-8:]) or "  (none yet)"
     return (
         "MODE: action\n"
@@ -104,5 +112,5 @@ def build_action_user(goal: str, facts: dict, plan_summary: str,
         f"PLAN: {plan_summary}\n"
         f"RECENT ACTIONS:\n{hist}\n"
         f"CURRENT APP: {screen.app_package}  SCREEN: {screen.activity}\n"
-        f"ELEMENTS (JSON): {json.dumps(elements)}\n"
+        f"ELEMENTS (JSON): {json.dumps(elements)}{more}\n"
     )

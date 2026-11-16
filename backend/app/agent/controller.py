@@ -208,14 +208,20 @@ class AgentController:
     async def _decide(self, task: Task, skill, screen: ScreenObservation) -> AgentAction:
         plan_summary = "; ".join(task.plan) + f"  | BOUNDARY: {task.approval_boundary}"
         user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen)
-        try:
-            data = await self.llm.complete_json(ACTION_SYSTEM, user, temperature=0.1, max_tokens=500)
-            return AgentAction(**data)
-        except (LLMError, ValueError, TypeError) as e:
-            log.warning("decide failed: %s", e)
-            return AgentAction(type=ActionType.ASK_USER,
-                               text="I couldn't interpret the screen. What should I do next?",
-                               thought=str(e))
+        last_err: Exception | None = None
+        # Reasoning models (gpt-oss) need headroom, and can occasionally return an empty
+        # body — retry once before falling back to asking the user.
+        for attempt in range(2):
+            try:
+                data = await self.llm.complete_json(
+                    ACTION_SYSTEM, user, temperature=0.1, max_tokens=1500)
+                return AgentAction(**data)
+            except (LLMError, ValueError, TypeError) as e:
+                last_err = e
+                log.warning("decide attempt %d failed: %s", attempt + 1, e)
+        return AgentAction(type=ActionType.ASK_USER,
+                           text="I couldn't interpret the screen. What should I do next?",
+                           thought=str(last_err))
 
     async def _act(self, device: DeviceSession, action: AgentAction, task: Task) -> None:
         await device.request("act", action=action.model_dump(mode="json"))
