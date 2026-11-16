@@ -38,7 +38,8 @@ class MockProvider(LLMProvider):
     name = "mock"
 
     async def complete(self, system: str, user: str, *, temperature: float = 0.2,
-                       max_tokens: int = 1024, json_mode: bool = False) -> str:
+                       max_tokens: int = 1024, json_mode: bool = False,
+                       image_b64: str | None = None) -> str:
         mode = _mode(user)
         if mode == "intent":
             return json.dumps(self._intent(user))

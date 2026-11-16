@@ -212,16 +212,19 @@ class AgentController:
         plan_summary = "; ".join(task.plan) + f"  | BOUNDARY: {task.approval_boundary}"
         user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen)
         last_err: Exception | None = None
-        # Reasoning models (gpt-oss) need headroom, and can occasionally return an empty
-        # body — retry once before falling back to asking the user.
-        for attempt in range(2):
+        # Prefer a vision pass (screenshot) — far better at locating controls like a
+        # search bar on a busy feed — then fall back to the text-only tree if vision
+        # fails or no screenshot is available.
+        shot = screen.screenshot_b64
+        attempts = [shot, None] if shot else [None, None]
+        for image in attempts:
             try:
                 data = await self.llm.complete_json(
-                    ACTION_SYSTEM, user, temperature=0.1, max_tokens=1500)
+                    ACTION_SYSTEM, user, temperature=0.1, max_tokens=1500, image_b64=image)
                 return AgentAction(**data)
             except (LLMError, ValueError, TypeError) as e:
                 last_err = e
-                log.warning("decide attempt %d failed: %s", attempt + 1, e)
+                log.warning("decide (%s) failed: %s", "vision" if image else "text", e)
         return AgentAction(type=ActionType.ASK_USER,
                            text="I couldn't interpret the screen. What should I do next?",
                            thought=str(last_err))

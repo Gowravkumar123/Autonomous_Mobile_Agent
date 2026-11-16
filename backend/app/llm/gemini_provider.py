@@ -16,13 +16,17 @@ class GeminiProvider(LLMProvider):
         self.model = model
 
     async def complete(self, system: str, user: str, *, temperature: float = 0.2,
-                       max_tokens: int = 1024, json_mode: bool = False) -> str:
+                       max_tokens: int = 1024, json_mode: bool = False,
+                       image_b64: str | None = None) -> str:
         gen_config: dict = {"temperature": temperature, "maxOutputTokens": max_tokens}
         if json_mode:
             gen_config["responseMimeType"] = "application/json"
+        parts: list = [{"text": user}]
+        if image_b64:
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": image_b64}})
         payload = {
             "systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "contents": [{"role": "user", "parts": parts}],
             "generationConfig": gen_config,
         }
         url = GEMINI_URL.format(model=self.model)

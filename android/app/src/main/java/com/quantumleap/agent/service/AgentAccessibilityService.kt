@@ -1,13 +1,19 @@
 package com.quantumleap.agent.service
 
 import android.accessibilityservice.AccessibilityService
+import android.graphics.Bitmap
+import android.os.Build
+import android.util.Base64
 import android.util.Log
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import com.quantumleap.agent.BuildConfig
 import com.quantumleap.agent.model.AgentAction
 import com.quantumleap.agent.net.AgentWebSocketClient
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
@@ -57,7 +63,59 @@ class AgentAccessibilityService : AccessibilityService(), AgentWebSocketClient.H
         val root = rootInActiveWindow
         val pkg = root?.packageName?.toString() ?: ""
         val activity = windows.firstOrNull()?.title?.toString() ?: ""
-        return serializer.capture(root, pkg, activity)
+        val screen = serializer.capture(root, pkg, activity)
+        captureScreenshotB64()?.let { screen.put("screenshot_b64", it) }
+        return screen
+    }
+
+    private val screenshotExecutor = Executors.newSingleThreadExecutor()
+
+    /** Take a screenshot of the current screen as a downscaled JPEG (base64), for the
+     *  vision model. Returns null if unavailable (API < 30) or on failure. */
+    private fun captureScreenshotB64(): String? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        val latch = CountDownLatch(1)
+        var out: String? = null
+        try {
+            takeScreenshot(Display.DEFAULT_DISPLAY, screenshotExecutor,
+                object : AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                        try {
+                            val hw = Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
+                            val soft = hw?.copy(Bitmap.Config.ARGB_8888, false)
+                            hw?.recycle()
+                            if (soft != null) {
+                                val scaled = scaleDown(soft, 720)
+                                val baos = ByteArrayOutputStream()
+                                scaled.compress(Bitmap.CompressFormat.JPEG, 50, baos)
+                                out = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+                                if (scaled !== soft) scaled.recycle()
+                                soft.recycle()
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "screenshot encode failed", e)
+                        } finally {
+                            result.hardwareBuffer.close()
+                            latch.countDown()
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        Log.w(TAG, "takeScreenshot failed: $errorCode")
+                        latch.countDown()
+                    }
+                })
+            latch.await(2, TimeUnit.SECONDS)
+        } catch (e: Exception) {
+            Log.w(TAG, "takeScreenshot threw", e)
+        }
+        return out
+    }
+
+    private fun scaleDown(bmp: Bitmap, maxW: Int): Bitmap {
+        if (bmp.width <= maxW) return bmp
+        val ratio = maxW.toFloat() / bmp.width
+        return Bitmap.createScaledBitmap(bmp, maxW, (bmp.height * ratio).toInt(), true)
     }
 
     override fun onAct(action: JSONObject): JSONObject {

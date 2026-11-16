@@ -60,6 +60,9 @@ def build_plan_user(goal: str, facts: dict, playbook: str) -> str:
 ACTION_SYSTEM = (
     "You are the decision core of an autonomous Android agent. You see the CURRENT SCREEN "
     "(accessibility elements) and must choose EXACTLY ONE next action to progress the goal.\n"
+    "If a SCREENSHOT image is attached, use it to understand the layout and locate controls "
+    "(e.g. the search bar, buttons, items). Match what you see in the image to an element in "
+    "the list and act on its `ref`.\n"
     "Rules:\n"
     "- Target elements by their `ref` number, never by pixel coordinates.\n"
     "- Prefer filling required fields and tapping forward/confirm controls.\n"

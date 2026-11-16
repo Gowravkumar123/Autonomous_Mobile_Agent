@@ -16,8 +16,10 @@ class LLMProvider(ABC):
 
     @abstractmethod
     async def complete(self, system: str, user: str, *, temperature: float = 0.2,
-                       max_tokens: int = 1024, json_mode: bool = False) -> str:
-        """Return the model's raw text response."""
+                       max_tokens: int = 1024, json_mode: bool = False,
+                       image_b64: str | None = None) -> str:
+        """Return the model's raw text response. `image_b64` is an optional JPEG
+        screenshot (base64, no data: prefix) for vision-capable models."""
         raise NotImplementedError
 
     async def complete_json(self, system: str, user: str, **kw: Any) -> dict:
