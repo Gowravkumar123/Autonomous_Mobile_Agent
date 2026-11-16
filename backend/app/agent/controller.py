@@ -162,6 +162,20 @@ class AgentController:
                 continue
             blind = 0
 
+            # ---- loop guard: same action repeated with no progress ----
+            if len(task.history) >= 4 and len(set(task.history[-4:])) == 1:
+                task.summary = self._summarize(task, success=False)
+                task.log("note", f"loop detected on '{task.history[-1]}' — stopping")
+                try:
+                    await device.push("ask_user", task_id=task.id,
+                                      questions=["I repeated the same step a few times without "
+                                                 "progress — the task may already be done. Please check."])
+                except Exception:
+                    pass
+                task.set_state(TaskState.WAITING_FOR_USER,
+                               f"repeated '{task.history[-1]}' without progress — please check")
+                break
+
             # ---- verify success first (a confirmation may already be on screen) ----
             if is_success(screen, skill, task):
                 task.summary = self._summarize(task, success=True)
