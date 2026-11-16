@@ -108,6 +108,7 @@ class AgentController:
         task.set_state(TaskState.RUNNING)
         self._emit(task)
 
+        blind = 0   # consecutive screens with neither a tree nor a screenshot (secure/loading)
         for step in range(MAX_STEPS):
             if task.cancel_requested:
                 task.set_state(TaskState.CANCELLED, "cancelled by user")
@@ -130,6 +131,28 @@ class AgentController:
             task.step_id = step
             self.store.publish(task.id, "observation", screen.activity,
                                app=screen.app_package, n_elements=len(screen.elements))
+
+            # Blind screen: no accessibility tree AND no screenshot. Usually a secure
+            # (FLAG_SECURE) screen — payment/checkout — that the app hides from capture.
+            # Don't tap blindly; give it a moment to load, then hand over to the user.
+            if not screen.elements and not screen.screenshot_b64:
+                blind += 1
+                if blind >= 3:
+                    task.summary = ("A protected screen (likely payment/checkout) is blocking "
+                                    "the agent from seeing it. Please take over on the phone.")
+                    task.log("note", "blind screen (secure) — handing to user")
+                    try:
+                        await device.push("ask_user", task_id=task.id,
+                                          questions=["This screen looks protected and I can't see it — "
+                                                     "please take over on your phone."])
+                    except Exception:
+                        pass
+                    task.set_state(TaskState.WAITING_FOR_USER,
+                                   "screen is protected (secure) — please take over")
+                    break
+                await asyncio.sleep(1.0)
+                continue
+            blind = 0
 
             # ---- verify success first (a confirmation may already be on screen) ----
             if is_success(screen, skill, task):
