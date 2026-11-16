@@ -18,11 +18,15 @@ from dataclasses import dataclass
 
 from ..mobile.schema import ActionType, AgentAction, ScreenObservation
 
-# Words on a SCREEN that signal a payment / authentication context.
+# Phrases on a SCREEN that signal a payment / authentication context. Deliberately
+# multi-word: bare words like "upi"/"otp" match payment-app icons and notifications on
+# the home screen and caused false pauses. The action-button check below still catches
+# "Pay"/"Place order" buttons, so these only need to cover secret-entry screens.
 FINANCIAL_SCREEN = [
-    "upi", "enter upi pin", "card number", "cvv", "net banking", "netbanking",
-    "wallet pin", "otp", "one time password", "enter pin", "biometric",
-    "proceed to pay", "make payment", "payment method", "add money",
+    "enter upi pin", "upi pin", "card number", "enter cvv", "cvv", "net banking",
+    "netbanking", "wallet pin", "one time password", "enter otp", "verify otp",
+    "enter pin", "enter mpin", "proceed to pay", "make payment", "payment method",
+    "add money", "enter your pin",
 ]
 # Words on a BUTTON the agent is about to tap that commit money.
 FINANCIAL_ACTION = [
