@@ -86,11 +86,16 @@ ACTION_SYSTEM = (
     "do NOT ask the user to choose routine, reversible things. Reserve `ask_user` for a genuinely "
     "missing required detail or a consequential, irreversible ambiguity. Never ask the same "
     "question twice — if you already asked, make a reasonable choice and proceed.\n"
+    "- If the control you need is VISIBLE in the screenshot but there is no matching entry in "
+    "the elements list (the list is empty or does not include it), use `tap_xy` with `x` and `y` "
+    "as fractions from 0.0 to 1.0 of the screen (x from the left edge, y from the top), pointing "
+    "at the CENTER of that control. Prefer tapping a real element `ref` when one exists; use "
+    "`tap_xy` as the fallback for empty/sparse screens.\n"
     "- If you are stuck or a required detail is truly missing, choose `ask_user` (put the question "
     "in `text`) or `fail`.\n"
-    "Reply as JSON with keys: `type` (tap|type|scroll|swipe|back|home|open_app|wait|ask_user|approve|done|fail), "
-    "`ref` (int|null), `text` (str|null), `direction` (up|down|left|right|null), `seconds` (num|null), "
-    "`thought` (str), `expectation` (str)."
+    "Reply as JSON with keys: `type` (tap|tap_xy|type|scroll|swipe|back|home|open_app|wait|ask_user|"
+    "approve|done|fail), `ref` (int|null), `x` (0-1 or null), `y` (0-1 or null), `text` (str|null), "
+    "`direction` (up|down|left|right|null), `seconds` (num|null), `thought` (str), `expectation` (str)."
 )
 
 

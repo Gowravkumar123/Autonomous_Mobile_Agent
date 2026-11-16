@@ -76,6 +76,7 @@ class ScreenObservation(BaseModel):
 # --------------------------------------------------------------------------- #
 class ActionType(str, Enum):
     TAP = "tap"
+    TAP_XY = "tap_xy"      # tap a point (normalized x/y) when no element ref is available
     TYPE = "type"
     SCROLL = "scroll"
     SWIPE = "swipe"
@@ -97,6 +98,8 @@ class AgentAction(BaseModel):
     text: Optional[str] = Field(None, description="Text to type, app to open, or message to the user.")
     direction: Optional[Literal["up", "down", "left", "right"]] = None
     seconds: Optional[float] = Field(None, description="For WAIT.")
+    x: Optional[float] = Field(None, description="For tap_xy: horizontal position, 0.0-1.0 of screen width.")
+    y: Optional[float] = Field(None, description="For tap_xy: vertical position, 0.0-1.0 of screen height.")
     # The model's own narration — shown in the UI log and used for verification.
     thought: str = ""
     expectation: str = Field("", description="What the screen should look like if this worked.")

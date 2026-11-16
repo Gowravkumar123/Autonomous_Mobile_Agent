@@ -30,6 +30,8 @@ data class AgentAction(
     val text: String?,
     val direction: String?,
     val seconds: Double?,
+    val x: Double?,
+    val y: Double?,
     val thought: String,
 ) {
     companion object {
@@ -39,6 +41,8 @@ data class AgentAction(
             text = if (json.isNull("text")) null else json.optString("text"),
             direction = if (json.isNull("direction")) null else json.optString("direction"),
             seconds = if (json.isNull("seconds")) null else json.optDouble("seconds"),
+            x = if (json.isNull("x")) null else json.optDouble("x"),
+            y = if (json.isNull("y")) null else json.optDouble("y"),
             thought = json.optString("thought"),
         )
     }

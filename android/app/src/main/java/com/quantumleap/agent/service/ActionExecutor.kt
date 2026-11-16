@@ -20,6 +20,7 @@ class ActionExecutor(private val service: AccessibilityService) {
     fun execute(action: AgentAction, nodesByRef: List<AccessibilityNodeInfo>): Boolean {
         return when (action.type) {
             "tap" -> tap(node(action.ref, nodesByRef))
+            "tap_xy" -> tapXY(action.x, action.y)
             "type" -> type(node(action.ref, nodesByRef), action.text ?: "")
             "scroll" -> scroll(action.direction ?: "down", nodesByRef)
             "swipe" -> swipe(action.direction ?: "up")
@@ -33,6 +34,16 @@ class ActionExecutor(private val service: AccessibilityService) {
 
     private fun node(ref: Int?, nodes: List<AccessibilityNodeInfo>): AccessibilityNodeInfo? =
         ref?.let { nodes.getOrNull(it) }
+
+    /** Tap a point given as fractions (0..1) of the screen — used when the tree has no
+     *  element to target but the screenshot shows the control. */
+    private fun tapXY(x: Double?, y: Double?): Boolean {
+        if (x == null || y == null) return false
+        val dm = service.resources.displayMetrics
+        val px = (x.coerceIn(0.0, 1.0) * dm.widthPixels).toFloat()
+        val py = (y.coerceIn(0.0, 1.0) * dm.heightPixels).toFloat()
+        return tapAt(px, py)
+    }
 
     private fun tap(node: AccessibilityNodeInfo?): Boolean {
         node ?: return false

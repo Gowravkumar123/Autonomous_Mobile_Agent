@@ -307,6 +307,8 @@ class AgentController:
             return f"type '{action.text}' into #{action.ref}"
         if action.type == ActionType.TAP:
             return f"tap #{action.ref}"
+        if action.type == ActionType.TAP_XY:
+            return f"tap ({action.x:.2f},{action.y:.2f})" if action.x is not None else "tap_xy"
         if action.type == ActionType.SCROLL:
             return f"scroll {action.direction or 'down'}"
         if action.type == ActionType.OPEN_APP:
