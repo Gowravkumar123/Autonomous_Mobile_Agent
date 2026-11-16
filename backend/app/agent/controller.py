@@ -230,7 +230,15 @@ class AgentController:
 
     async def _decide(self, task: Task, skill, screen: ScreenObservation) -> AgentAction:
         plan_summary = "; ".join(task.plan) + f"  | BOUNDARY: {task.approval_boundary}"
-        user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen)
+        # When the accessibility tree is sparse/empty but we have a screenshot, OCR the
+        # image so the agent can READ names/prices (and tap them) via tap_xy.
+        ocr: list[dict] = []
+        if screen.screenshot_b64 and len(screen.elements) <= 6:
+            from ..vision.ocr import ocr_items
+            ocr = await asyncio.get_event_loop().run_in_executor(
+                None, ocr_items, screen.screenshot_b64)
+        user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen,
+                                 ocr_items=ocr)
         last_err: Exception | None = None
         # Prefer a vision pass (screenshot) — far better at locating controls like a
         # search bar on a busy feed — then fall back to the text-only tree if vision

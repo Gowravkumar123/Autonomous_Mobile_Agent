@@ -101,7 +101,8 @@ ACTION_SYSTEM = (
 
 def build_action_user(goal: str, facts: dict, plan_summary: str,
                       history: list[str], screen: ScreenObservation,
-                      max_elements: int = 70, max_text: int = 70) -> str:
+                      max_elements: int = 70, max_text: int = 70,
+                      ocr_items: list[dict] | None = None) -> str:
     def clip(s: str) -> str:
         s = s or ""
         return s[:max_text] + "…" if len(s) > max_text else s
@@ -127,4 +128,6 @@ def build_action_user(goal: str, facts: dict, plan_summary: str,
         f"RECENT ACTIONS:\n{hist}\n"
         f"CURRENT APP: {screen.app_package}  SCREEN: {screen.activity}\n"
         f"ELEMENTS (JSON): {json.dumps(elements)}{more}\n"
+        + (f"VISIBLE TEXT (OCR — read from the screenshot; each has x,y as 0-1 screen "
+           f"fractions you can use with tap_xy): {json.dumps(ocr_items)}\n" if ocr_items else "")
     )
