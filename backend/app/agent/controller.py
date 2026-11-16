@@ -79,8 +79,9 @@ class AgentController:
             await self._execute_phase(task)
         except Exception as e:  # defensive: never leave a task hung
             log.exception("task %s crashed", task.id)
-            task.error = str(e)
-            task.set_state(TaskState.FAILED, f"internal error: {e}")
+            import traceback
+            task.error = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-600:]}"
+            task.set_state(TaskState.FAILED, f"internal error: {type(e).__name__}: {e}")
             self._emit(task)
         finally:
             self._approvals.pop(task.id, None)
@@ -103,12 +104,6 @@ class AgentController:
             task.clarifications = []
 
     async def _execute_phase(self, task: Task) -> None:
-        device = self.devices.get(task.device_id) or self.devices.any()
-        if device is None:
-            task.set_state(TaskState.FAILED, "no paired device connected")
-            self._emit(task)
-            return
-
         skill = registry.get(task.skill)
         task.set_state(TaskState.RUNNING)
         self._emit(task)
@@ -118,10 +113,18 @@ class AgentController:
                 task.set_state(TaskState.CANCELLED, "cancelled by user")
                 break
 
+            # Re-fetch the device each step: the phone can drop and reconnect mid-task
+            # (aggressive OEM battery management), which replaces the session. Holding a
+            # stale reference was crashing the resume after an approval pause.
+            device = await self._await_device(task)
+            if device is None:
+                task.set_state(TaskState.FAILED, "device disconnected and did not return")
+                break
+
             # ---- observe ----
             try:
                 screen = await self._observe(device)
-            except (LLMError, asyncio.TimeoutError, RuntimeError) as e:
+            except (LLMError, asyncio.TimeoutError, RuntimeError, OSError) as e:
                 task.set_state(TaskState.FAILED, f"lost the device: {e}")
                 break
             task.step_id = step
@@ -184,6 +187,11 @@ class AgentController:
                     break
                 task.approvals_granted += 1
                 task.set_state(TaskState.RUNNING)
+                # The wait may have been long; the device could have reconnected meanwhile.
+                device = await self._await_device(task)
+                if device is None:
+                    task.set_state(TaskState.FAILED, "device disconnected during approval")
+                    break
                 if decision.risk_level >= 4:
                     # User-only action (payment/auth). The user performs it; we re-observe.
                     await device.request("handoff", approval=self._approval_payload(task, decision, action, screen))
@@ -204,6 +212,18 @@ class AgentController:
     # ----------------------------------------------------------------- #
     # Steps
     # ----------------------------------------------------------------- #
+    async def _await_device(self, task: Task, timeout: float = 12.0) -> DeviceSession | None:
+        """Return a connected device, waiting briefly if it is mid-reconnect."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while True:
+            dev = self.devices.get(task.device_id) or self.devices.any()
+            if dev is not None:
+                return dev
+            if task.cancel_requested or loop.time() >= deadline:
+                return None
+            await asyncio.sleep(1.0)
+
     async def _observe(self, device: DeviceSession) -> ScreenObservation:
         payload = await device.request("observe")
         return ScreenObservation(**(payload.get("screen", payload)))
