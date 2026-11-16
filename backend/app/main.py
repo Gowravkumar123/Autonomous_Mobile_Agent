@@ -63,7 +63,8 @@ class Answer(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "llm": app.state.llm.active,
+    from .vision.ocr import available as ocr_available
+    return {"ok": True, "llm": app.state.llm.active, "ocr": ocr_available(),
             "devices": list(app.state.devices._sessions.keys())}
 
 

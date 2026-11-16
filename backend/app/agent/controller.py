@@ -234,9 +234,14 @@ class AgentController:
         # image so the agent can READ names/prices (and tap them) via tap_xy.
         ocr: list[dict] = []
         if screen.screenshot_b64 and len(screen.elements) <= 6:
-            from ..vision.ocr import ocr_items
+            from ..vision.ocr import available, ocr_items
             ocr = await asyncio.get_event_loop().run_in_executor(
                 None, ocr_items, screen.screenshot_b64)
+            task.log("note", f"OCR: {'on' if available() else 'OFF'}, {len(ocr)} items, "
+                             f"shot={'yes' if screen.screenshot_b64 else 'no'}, "
+                             f"els={len(screen.elements)}")
+        elif len(screen.elements) <= 6:
+            task.log("note", f"no screenshot (vision/OCR unavailable), els={len(screen.elements)}")
         user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen,
                                  ocr_items=ocr)
         last_err: Exception | None = None
