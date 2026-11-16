@@ -14,9 +14,10 @@ android {
         versionCode = 1
         versionName = "0.1.0"
 
-        // Point this at your backend. For the Android emulator, the host machine is 10.0.2.2.
-        buildConfigField("String", "BACKEND_WS_URL", "\"ws://10.0.2.2:8000\"")
-        buildConfigField("String", "BACKEND_HTTP_URL", "\"http://10.0.2.2:8000\"")
+        // Points at the on-prem backend. The phone must be on a network that can
+        // route to this IP. (Emulator-to-host would be 10.0.2.2 instead.)
+        buildConfigField("String", "BACKEND_WS_URL", "\"ws://10.20.0.13:8005\"")
+        buildConfigField("String", "BACKEND_HTTP_URL", "\"http://10.20.0.13:8005\"")
     }
 
     buildFeatures {

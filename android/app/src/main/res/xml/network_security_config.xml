@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The on-prem backend is plain HTTP/WS (no TLS yet), which Android blocks by default
+  on API 28+. Permit cleartext ONLY to the backend host for testing. Once the server
+  is behind HTTPS/WSS, remove this and switch the app URLs to https:// / wss://.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">10.20.0.13</domain>
+    </domain-config>
+</network-security-config>
