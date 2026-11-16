@@ -159,6 +159,16 @@ class AgentController:
                 task.facts.update(facts or {})
                 continue
 
+            # ---- avoid redundant app launches; let a launched app settle ----
+            if action.type == ActionType.OPEN_APP:
+                if screen.app_package and screen.app_package in registry.get(task.skill).app_packages:
+                    self.store.publish(task.id, "note", f"already in {screen.app_package}, skip open")
+                    task.history.append(f"(already in {screen.app_package}; skipped open_app)")
+                    continue
+                await self._act(device, action, task)
+                await asyncio.sleep(2.5)   # apps take time to launch before the next observe
+                continue
+
             # ---- policy gate (deterministic) ----
             decision = self.policy.evaluate(action, screen)
             audit(task.id, "policy", decision.reason, risk=decision.risk_level,
