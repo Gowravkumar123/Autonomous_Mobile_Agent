@@ -1,22 +1,18 @@
 name: Build Android APK
 
-# Builds an installable debug APK on GitHub's runners and uploads it as an artifact.
-# Download it from the run's "Artifacts" section, transfer to your phone, and install
-# (enable "Install unknown apps" for your file manager / browser).
-
 on:
   push:
     paths:
       - 'android/**'
       - '.github/workflows/android.yml'
-  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # lets the failure step push the captured log to a branch
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: android
     steps:
       - uses: actions/checkout@v4
 
@@ -26,20 +22,38 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # ubuntu-latest ships the Android SDK pre-installed (ANDROID_HOME is set,
-      # licenses pre-accepted), so no separate SDK setup step is needed.
-
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+        id: build
+        continue-on-error: true
+        working-directory: android
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Capture log on failure
+        if: steps.build.outcome == 'failure'
+        run: |
+          mkdir -p ci-logs
+          tail -c 60000 "$RUNNER_TEMP/build.log" > ci-logs/last-build.log
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git add -f ci-logs/last-build.log
+          git commit -m "ci: capture build log [skip ci]"
+          git push origin HEAD:ci-build-log --force
 
       - name: Upload APK
+        if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: agent-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      - name: Propagate build result
+        if: steps.build.outcome == 'failure'
+        run: exit 1
