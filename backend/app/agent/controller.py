@@ -299,11 +299,12 @@ class AgentController:
         user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen,
                                  ocr_items=ocr)
         last_err: Exception | None = None
-        # Prefer a vision pass (screenshot) — far better at locating controls like a
-        # search bar on a busy feed — then fall back to the text-only tree if vision
-        # fails or no screenshot is available.
-        shot = screen.screenshot_b64
-        attempts = [shot, None] if shot else [None, None]
+        # Tree-first for speed: sending a screenshot to the model every step is slow
+        # (especially Gemini free tier). Use vision ONLY when the accessibility tree is
+        # sparse (few elements) — that's where the screenshot actually adds value; for
+        # populated screens the tree (with grouping) is enough and far faster.
+        use_vision = bool(screen.screenshot_b64) and len(screen.elements) <= 8
+        attempts = [screen.screenshot_b64, None] if use_vision else [None, None]
         for image in attempts:
             try:
                 data = await self.llm.complete_json(
