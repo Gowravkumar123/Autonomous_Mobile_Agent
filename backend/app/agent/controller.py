@@ -198,9 +198,12 @@ class AgentController:
                                  ocr_items=ocr, feedback=feedback)
         last_err: Exception | None = None
         # Populated screens: fast gpt-oss text call from the tree (+ grouping). Sparse
-        # screens: send the screenshot to Groq's vision model (qwen) to locate controls,
-        # falling back to text (tree + OCR) if vision errors. All on Groq, so fast.
-        use_vision = bool(screen.screenshot_b64) and len(screen.elements) <= 8
+        # screens, OR when the text path just got stuck (reflection feedback present):
+        # send the screenshot to Groq's vision model (qwen) to locate controls, falling
+        # back to text (tree + OCR) if vision errors. All on Groq, so fast. Escalating to
+        # vision when stuck gives the model "eyes" exactly when the tree wasn't enough
+        # (e.g. a dense/WebView booking screen it keeps misreading).
+        use_vision = bool(screen.screenshot_b64) and (len(screen.elements) <= 8 or bool(feedback))
         attempts = [screen.screenshot_b64, None] if use_vision else [None, None]
         for image in attempts:
             try:

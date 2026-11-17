@@ -9,6 +9,7 @@
     android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagReportViewIds|flagRequestFilterKeyEvents"
     android:canPerformGestures="true"
     android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
     android:notificationTimeout="100"
     android:description="@string/service_description"
     android:settingsActivity="com.quantumleap.agent.ui.MainActivity" />
