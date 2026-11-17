@@ -207,6 +207,20 @@ def build_react_graph(controller):
                 react_attempts = 0      # it worked (or wasn't expected to change the screen)
         updates["react_attempts"] = react_attempts
 
+        # --- scroll-streak nudge: the model tends to scroll past the control it should
+        #     tap (e.g. a 'Book tickets' CTA). After 2 scrolls in a row, don't give up —
+        #     reflect it toward tapping a visible actionable control before the hard loop
+        #     guard below would hand off. ---
+        if (not updates.get("feedback")
+                and len(task.history) >= 2
+                and all(h.startswith("scroll") for h in task.history[-2:])):
+            updates["feedback"] = (
+                "You have scrolled twice in a row. STOP scrolling. Look at the elements NOW "
+                "and TAP the most relevant actionable control for the goal — e.g. a 'Book "
+                "tickets' / 'Book' button, the movie, a showtime, or a seat. Only scroll "
+                "again if nothing relevant is visible.")
+            c.store.publish(task.id, "reflect", "scroll streak — nudging a tap")
+
         # --- success marker already on screen? ---
         if is_success(screen, skill, task):
             task.summary = c._summarize(task, success=True)
