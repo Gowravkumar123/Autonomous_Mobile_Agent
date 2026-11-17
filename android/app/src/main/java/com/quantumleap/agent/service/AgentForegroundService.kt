@@ -10,8 +10,8 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
-import android.os.IBinder
 import android.os.Looper
+import android.os.IBinder
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -31,15 +31,12 @@ import java.io.IOException
 import java.util.Locale
 
 /**
- * Foreground service: keeps the process alive, and hosts the voice assistant.
+ * Foreground service: keeps the process alive and runs the "Zoro" voice assistant.
  *
- * Wake word: it continuously listens; when it hears the assistant's name (default
- * "zoro", e.g. "hi zoro"), it greets you, listens for a command, and runs it — all
- * hands-free, in the background. It also speaks the agent's clarifying questions and
- * approvals and takes your spoken answer.
- *
- * NOTE: Android's SpeechRecognizer is not a true always-on hotword engine, so this is a
- * continuous listen-loop (heavier on battery, less precise than a dedicated wake engine).
+ * Only ONE microphone session runs at a time, driven by an explicit state machine so the
+ * wake-word loop and the task's clarification/approval Q&A never fight over the recognizer
+ * (which previously left it stuck "in voice mode"). Recognizer errors retry and give
+ * spoken feedback instead of failing silently.
  */
 class AgentForegroundService : Service() {
 
@@ -49,8 +46,11 @@ class AgentForegroundService : Service() {
     private val http = OkHttpClient()
     private var tts: TextToSpeech? = null
     private var ttsReady = false
-    @Volatile private var mode = Mode.IDLE
     private var recognizer: SpeechRecognizer? = null
+
+    @Volatile private var mode = Mode.IDLE
+    @Volatile private var wakeEnabled = false
+    private val wakeRunnable = Runnable { if (mode == Mode.WAKE) listenWake() }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -62,110 +62,126 @@ class AgentForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForegroundSafely()
         when (intent?.action) {
-            ACTION_WAKE_ON -> { mode = Mode.WAKE; armWake() }
-            ACTION_WAKE_OFF -> { mode = Mode.IDLE; destroyRecognizer() }
-            ACTION_ASK -> interrupt {
-                speakThenListen(intent.getStringExtra(EXTRA_PROMPT) ?: "I need more information.") { a ->
-                    AgentAccessibilityService.instance?.answerClarification(a)
-                }
+            ACTION_WAKE_ON -> { wakeEnabled = true; backToWake() }
+            ACTION_WAKE_OFF -> { wakeEnabled = false; mode = Mode.IDLE; cancelAll() }
+            ACTION_ASK -> handleQuestion(intent.getStringExtra(EXTRA_PROMPT) ?: "I need more information.") { a ->
+                AgentAccessibilityService.instance?.answerClarification(a)
             }
-            ACTION_APPROVE -> interrupt {
-                val s = intent.getStringExtra(EXTRA_PROMPT) ?: "Approval needed."
-                speakThenListen("$s. Say approve to continue, or decline.") { a ->
-                    val l = a.lowercase()
-                    when {
-                        listOf("approve", "yes", "okay", "ok", "proceed", "confirm").any { it in l } ->
-                            AgentAccessibilityService.instance?.answerApproval(true)
-                        listOf("decline", "no", "cancel", "stop").any { it in l } ->
-                            AgentAccessibilityService.instance?.answerApproval(false)
-                        else -> speak("I didn't catch that; use the app to decide.")
-                    }
+            ACTION_APPROVE -> handleQuestion(
+                (intent.getStringExtra(EXTRA_PROMPT) ?: "Approval needed.") +
+                    ". Say approve to continue, or decline.") { a ->
+                val l = a.lowercase()
+                when {
+                    listOf("approve", "yes", "okay", "ok", "proceed", "confirm", "do it").any { it in l } ->
+                        AgentAccessibilityService.instance?.answerApproval(true)
+                    listOf("decline", "no", "cancel", "stop", "don't").any { it in l } ->
+                        AgentAccessibilityService.instance?.answerApproval(false)
+                    else -> speak("I didn't catch that; please decide in the app.")
                 }
             }
         }
         return START_STICKY
     }
 
-    override fun onDestroy() { destroyRecognizer(); tts?.shutdown(); super.onDestroy() }
+    override fun onDestroy() { cancelAll(); tts?.shutdown(); super.onDestroy() }
 
-    // ---------------- wake loop ---------------- //
-    private fun assistantName(): String =
+    // ------------------------------------------------------------------ //
+    private fun name(): String =
         getSharedPreferences("agent", Context.MODE_PRIVATE).getString("name", "zoro") ?: "zoro"
 
-    private fun armWake() {
-        if (mode != Mode.WAKE) return
-        listen(
-            onResult = { text ->
-                val name = assistantName().lowercase()
-                if (text.lowercase().contains(name)) onWake(text, name)
-                else reArm(300)
-            },
-            onError = { reArm(600) })
+    /** Idle/wake return point, honoring whether the wake word is enabled. */
+    private fun backToWake() {
+        if (wakeEnabled) { mode = Mode.WAKE; scheduleWake(900) }
+        else { mode = Mode.IDLE; cancelAll() }
     }
 
-    private fun reArm(delay: Long) { if (mode == Mode.WAKE) main.postDelayed({ armWake() }, delay) }
+    private fun scheduleWake(delay: Long) {
+        main.removeCallbacks(wakeRunnable)
+        if (mode == Mode.WAKE) main.postDelayed(wakeRunnable, delay)
+    }
 
-    /** Heard the name. If the utterance already includes a command ("zoro, open camera"),
-     *  use it; otherwise greet and listen for the command. */
-    private fun onWake(utterance: String, name: String) {
+    private fun listenWake() {
+        if (mode != Mode.WAKE) return
+        listenOnce(
+            onResult = { text ->
+                val n = name().lowercase()
+                if (text.lowercase().contains(n)) onWake(text, n) else scheduleWake(250)
+            },
+            onFail = { scheduleWake(600) })
+    }
+
+    private fun onWake(utterance: String, n: String) {
         mode = Mode.BUSY
-        val after = utterance.lowercase().substringAfter(name).trim().trimStart(',', '.', ' ')
-        val command = after.removePrefix("hi").removePrefix("hey").trim()
-        if (command.length > 3) {
-            runCommand(command)
-        } else {
-            speakThenListen("Yes?") { cmd -> runCommand(cmd) }
-        }
+        main.removeCallbacks(wakeRunnable)
+        val tail = utterance.lowercase().substringAfter(n).trim().trimStart(',', '.', ' ')
+            .removePrefix("hi").removePrefix("hey").trim()
+        if (tail.length > 3) runCommand(tail)
+        else speakThen("Yes?") { listenCommand(0) }
+    }
+
+    private fun listenCommand(attempt: Int) {
+        listenOnce(
+            onResult = { runCommand(it) },
+            onFail = {
+                if (attempt < 1) listenCommand(attempt + 1)
+                else { speak("I didn't catch that."); backToWake() }
+            })
     }
 
     private fun runCommand(command: String) {
-        if (command.isBlank()) { resumeWake(); return }
+        if (command.isBlank()) { backToWake(); return }
         createTask(command)
         speak("On it.")
-        resumeWake()
+        backToWake()
     }
 
-    private fun resumeWake() { mode = Mode.WAKE; reArm(800) }
-
-    private fun interrupt(block: () -> Unit) {
-        val wasWake = (mode == Mode.WAKE)
+    /** Speak the agent's question and capture the spoken answer (with retry + feedback). */
+    private fun handleQuestion(question: String, onAnswer: (String) -> Unit) {
         mode = Mode.BUSY
-        destroyRecognizer()
-        block()
-        // speakThenListen/listen will call back; when done they don't auto-resume, so
-        // schedule a resume to wake-mode shortly after.
-        if (wasWake) main.postDelayed({ if (mode == Mode.BUSY) resumeWake() }, 12000)
+        main.removeCallbacks(wakeRunnable)
+        speakThen(question) { listenAnswer(question, onAnswer, 0) }
     }
 
-    // ---------------- task ---------------- //
+    private fun listenAnswer(question: String, onAnswer: (String) -> Unit, attempt: Int) {
+        listenOnce(
+            onResult = { a -> onAnswer(a); backToWake() },
+            onFail = {
+                if (attempt < 1) listenAnswer(question, onAnswer, attempt + 1)
+                else { speak("I didn't catch that; you can answer in the app."); backToWake() }
+            })
+    }
+
+    // ------------------------------------------------------------------ //
     private fun createTask(prompt: String) {
         val body = JSONObject().put("prompt", prompt).toString()
             .toRequestBody("application/json".toMediaType())
         val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/tasks").post(body).build()
         http.newCall(req).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) { Log.w(TAG, "task post failed: ${e.message}") }
+            override fun onFailure(call: Call, e: IOException) {
+                Log.w(TAG, "task post failed: ${e.message}"); main.post { speak("I couldn't reach the server.") }
+            }
             override fun onResponse(call: Call, response: Response) { response.close() }
         })
     }
 
-    // ---------------- speech ---------------- //
     private fun speak(text: String) { if (ttsReady) tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u") }
 
-    private fun speakThenListen(text: String, onAnswer: (String) -> Unit) {
+    private fun speakThen(text: String, after: () -> Unit) {
         val t = tts
-        if (t == null || !ttsReady) { listen(onAnswer) { }; return }
+        if (t == null || !ttsReady) { main.post(after); return }
         t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(id: String?) {}
-            override fun onError(id: String?) { main.post { listen(onAnswer) { } } }
-            override fun onDone(id: String?) { main.post { listen(onAnswer) { } } }
+            override fun onError(id: String?) { main.post(after) }
+            override fun onDone(id: String?) { main.post(after) }
         })
-        t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "ask")
+        t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "say")
     }
 
-    private fun listen(onResult: (String) -> Unit, onError: () -> Unit) {
-        main.post {
-            if (!SpeechRecognizer.isRecognitionAvailable(this)) { onError(); return@post }
-            destroyRecognizer()
+    /** Exactly one recognizer at a time; a short gap after destroy avoids ERROR_BUSY. */
+    private fun listenOnce(onResult: (String) -> Unit, onFail: () -> Unit) {
+        destroyRecognizer()
+        main.postDelayed({
+            if (!SpeechRecognizer.isRecognitionAvailable(this)) { onFail(); return@postDelayed }
             val r = SpeechRecognizer.createSpeechRecognizer(this)
             recognizer = r
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -175,9 +191,9 @@ class AgentForegroundService : Service() {
             r.setRecognitionListener(object : RecognitionListener {
                 override fun onResults(results: Bundle?) {
                     val best = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                    if (best.isNullOrBlank()) onError() else onResult(best)
+                    if (best.isNullOrBlank()) onFail() else onResult(best)
                 }
-                override fun onError(error: Int) { onError() }
+                override fun onError(error: Int) { onFail() }
                 override fun onReadyForSpeech(p: Bundle?) {}
                 override fun onBeginningOfSpeech() {}
                 override fun onEndOfSpeech() {}
@@ -186,14 +202,16 @@ class AgentForegroundService : Service() {
                 override fun onPartialResults(p: Bundle?) {}
                 override fun onEvent(t: Int, p: Bundle?) {}
             })
-            try { r.startListening(intent) } catch (e: Exception) { onError() }
-        }
+            try { r.startListening(intent) } catch (e: Exception) { onFail() }
+        }, 350)
     }
 
     private fun destroyRecognizer() {
-        try { recognizer?.destroy() } catch (_: Exception) {}
+        try { recognizer?.cancel(); recognizer?.destroy() } catch (_: Exception) {}
         recognizer = null
     }
+
+    private fun cancelAll() { main.removeCallbacks(wakeRunnable); destroyRecognizer() }
 
     private fun startForegroundSafely() {
         val channelId = "agent_fg"
@@ -204,7 +222,7 @@ class AgentForegroundService : Service() {
         }
         val notif: Notification = Notification.Builder(this, channelId)
             .setContentTitle("OnePiece")
-            .setContentText(if (mode == Mode.WAKE) "Listening for \"${assistantName()}\"" else "Connected and ready")
+            .setContentText(if (wakeEnabled) "Listening for \"${name()}\"" else "Connected and ready")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true).build()
         try {
