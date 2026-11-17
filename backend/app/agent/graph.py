@@ -37,7 +37,15 @@ import hashlib
 import logging
 from typing import Any, Optional, TypedDict
 
-from langgraph.graph import END, START, StateGraph
+try:
+    from langgraph.graph import END, START, StateGraph
+    _HAS_LANGGRAPH = True
+except Exception as _lg_err:  # not installed / unavailable on this Python
+    _HAS_LANGGRAPH = False
+    END, START, StateGraph = "__end__", "__start__", None
+    logging.getLogger("agent.graph").warning(
+        "langgraph unavailable (%s) — using the built-in ReAct driver "
+        "(same nodes, no dependency)", _lg_err)
 
 from ..audit.logger import audit
 from ..mobile.schema import ActionType, AgentAction, ScreenObservation
@@ -321,16 +329,40 @@ def build_react_graph(controller):
             return nxt if state.get("status", "run") == "run" else END
         return route
 
+    nodes = {"observe": observe, "validate": validate, "reason": reason, "act": act}
+    edges = {"observe": "validate", "validate": "reason", "reason": "act", "act": "observe"}
+
+    if not _HAS_LANGGRAPH:
+        # Built-in driver: runs the exact same nodes + routing, no dependency.
+        return _ReActDriver(nodes, edges, start="observe")
+
     g = StateGraph(AgentState)
-    g.add_node("observe", observe)
-    g.add_node("validate", validate)
-    g.add_node("reason", reason)
-    g.add_node("act", act)
-
+    for name, fn in nodes.items():
+        g.add_node(name, fn)
     g.add_edge(START, "observe")
-    g.add_conditional_edges("observe", _route("validate"), {"validate": "validate", END: END})
-    g.add_conditional_edges("validate", _route("reason"), {"reason": "reason", END: END})
-    g.add_conditional_edges("reason", _route("act"), {"act": "act", END: END})
-    g.add_conditional_edges("act", _route("observe"), {"observe": "observe", END: END})
-
+    for src, dst in edges.items():
+        g.add_conditional_edges(src, _route(dst), {dst: dst, END: END})
     return g.compile()
+
+
+class _ReActDriver:
+    """Sequential runner for the ReAct graph when langgraph isn't installed.
+
+    Executes the identical nodes and status-gated routing as the compiled StateGraph:
+    run a node, merge its state delta, stop if status left "run", else follow the edge.
+    """
+
+    def __init__(self, nodes: dict, edges: dict, start: str = "observe"):
+        self._nodes = nodes
+        self._edges = edges
+        self._start = start
+
+    async def ainvoke(self, state: dict, config: dict | None = None) -> dict:
+        limit = (config or {}).get("recursion_limit", 10_000)
+        node = self._start
+        for _ in range(limit):
+            state.update(await self._nodes[node](state) or {})
+            if state.get("status", "run") != "run":
+                break
+            node = self._edges[node]
+        return state

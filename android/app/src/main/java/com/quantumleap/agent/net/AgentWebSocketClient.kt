@@ -34,9 +34,14 @@ class AgentWebSocketClient(
         fun onStatus(message: JSONObject)
     }
 
+    // Longer ping interval tolerates mobile-network jitter to the cloud backend (a 20s
+    // pong timeout was dropping the socket on brief hiccups). If a flap does happen, the
+    // backend re-delivers any pending prompt on reconnect, so nothing is lost.
     private val client = OkHttpClient.Builder()
-        .pingInterval(20, TimeUnit.SECONDS)
+        .pingInterval(40, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     @Volatile private var socket: WebSocket? = null

@@ -167,6 +167,8 @@ async def ws_device(socket: WebSocket, device_id: str):
     session = DeviceSession(device_id, socket)
     app.state.devices.add(session)
     controller: AgentController = app.state.controller
+    # Re-deliver any prompt a waiting task is blocked on (survives ws flaps).
+    asyncio.create_task(controller.on_device_connected(session))
     try:
         while True:
             msg = await socket.receive_json()

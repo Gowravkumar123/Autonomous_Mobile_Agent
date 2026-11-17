@@ -42,7 +42,29 @@ class AgentController:
         self.memory = memory
         self._approvals: dict[str, asyncio.Future] = {}
         self._answers: dict[str, asyncio.Future] = {}
+        # Last prompt (ask_user / approval_request) pushed per waiting task, so we can
+        # re-deliver it when the device reconnects after a flap. (type, data) keyed by task.
+        self._pending_prompts: dict[str, tuple[str, dict]] = {}
         self._graph = None  # compiled lazily (imports langgraph on first run)
+
+    async def on_device_connected(self, session: DeviceSession) -> None:
+        """A device (re)connected: re-push any prompt a waiting task is blocked on.
+
+        Pushes are fire-and-forget; if the socket was mid-flap when we asked, the phone
+        never saw the question and the task would hang. Re-delivering on reconnect makes
+        that self-heal (OEM battery kills + mobile-network jitter make flaps routine).
+        """
+        for task_id, (ptype, data) in list(self._pending_prompts.items()):
+            task = self.store.get(task_id)
+            if not task or task.state is not TaskState.WAITING_FOR_USER:
+                continue
+            if task.device_id and task.device_id != session.device_id:
+                continue
+            try:
+                await session.push(ptype, **data)
+                self.store.publish(task_id, "note", "re-sent pending prompt after reconnect")
+            except Exception as e:
+                log.warning("re-deliver to %s failed: %s", session.device_id, e)
 
     @property
     def graph(self):
@@ -216,14 +238,21 @@ class AgentController:
         task.pending_approval_reason = decision.reason
         task.log("approval_requested", decision.reason, risk=decision.risk_level, **payload)
         task.set_state(TaskState.WAITING_FOR_USER, decision.reason)
-        await device.push("approval_request", **payload)
+        self._pending_prompts[task.id] = ("approval_request", payload)
+        try:
+            await device.push("approval_request", **payload)
+        except Exception as e:
+            log.warning("approval push failed (will re-deliver on reconnect): %s", e)
         self.store.publish(task.id, "approval", decision.reason, approval=payload)
         audit(task.id, "approval_requested", decision.reason, approval=payload)
 
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._approvals[task.id] = fut
-        approved, note = await fut
-        self._approvals.pop(task.id, None)
+        try:
+            approved, note = await fut
+        finally:
+            self._approvals.pop(task.id, None)
+            self._pending_prompts.pop(task.id, None)
         audit(task.id, "approval_decided", f"approved={approved}", note=note)
         self.store.publish(task.id, "approval_decided", f"approved={approved}")
         return approved
@@ -249,13 +278,21 @@ class AgentController:
                            questions=composed, choices=choices)
         audit(task.id, "ask_user", " | ".join(composed))
         # Surface the question(s) to the paired device/companion UI so the user can answer.
+        prompt = {"task_id": task.id, "questions": composed, "choices": choices}
+        self._pending_prompts[task.id] = ("ask_user", prompt)
         device = self.devices.get(task.device_id) or self.devices.any()
         if device:
-            await device.push("ask_user", task_id=task.id, questions=composed, choices=choices)
+            try:
+                await device.push("ask_user", **prompt)
+            except Exception as e:
+                log.warning("ask_user push failed (will re-deliver on reconnect): %s", e)
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._answers[task.id] = fut
-        facts = await fut
-        self._answers.pop(task.id, None)
+        try:
+            facts = await fut
+        finally:
+            self._answers.pop(task.id, None)
+            self._pending_prompts.pop(task.id, None)
         return facts or {}
 
     # ----------------------------------------------------------------- #
