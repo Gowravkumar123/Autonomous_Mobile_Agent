@@ -100,33 +100,13 @@ class MainActivity : AppCompatActivity() {
         })
         root.addView(row)
 
-        // --- hands-free wake word ("Hi <name>") ---
-        val prefs = getSharedPreferences("agent", MODE_PRIVATE)
-        val nameField = EditText(this).apply {
-            hint = "Assistant name (e.g. zoro)"
-            setText(prefs.getString("name", "zoro"))
-        }
+        // --- voice (push-to-talk) ---
         root.addView(TextView(this).apply {
-            text = "3 · Hands-free wake word — say \"Hi <name>\""; setPadding(0, 24, 0, 8)
+            text = "3 · Voice: tap 🎤 Speak above, or pull down the notification and tap " +
+                   "\"Speak\", then say your command. Zoro speaks its questions and takes " +
+                   "your spoken answer."
+            setPadding(0, 24, 0, 8)
         })
-        root.addView(nameField)
-        val wakeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        wakeRow.addView(Button(this).apply {
-            text = "Enable wake word"
-            setOnClickListener {
-                if (!hasMic()) { ensureMicPermission(); return@setOnClickListener }
-                val n = nameField.text.toString().trim().ifEmpty { "zoro" }.lowercase()
-                prefs.edit().putString("name", n).apply()
-                AgentForegroundService.wakeOn(this@MainActivity)
-                speak("Listening. Say hi $n.")
-                toast("Listening for 'Hi $n'")
-            }
-        })
-        wakeRow.addView(Button(this).apply {
-            text = "Disable"
-            setOnClickListener { AgentForegroundService.wakeOff(this@MainActivity); toast("Wake word off") }
-        })
-        root.addView(wakeRow)
 
         status = TextView(this).apply { text = "Status: idle"; setPadding(0, 32, 0, 16) }
         root.addView(status)
