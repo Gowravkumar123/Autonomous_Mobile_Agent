@@ -11,6 +11,22 @@ import json
 
 from ..mobile.schema import ScreenObservation
 
+# Package -> friendly name, so the model knows which app it is in (e.g. it mistook
+# com.bt.bms for a "banking app" when it is BookMyShow).
+KNOWN_APPS = {
+    "com.bt.bms": "BookMyShow (movie tickets)",
+    "in.swiggy.android": "Swiggy (food)",
+    "com.application.zomato": "Zomato (food)",
+    "com.application.zomato.district": "Zomato District",
+    "com.whatsapp": "WhatsApp (messaging)",
+    "org.telegram.messenger": "Telegram (messaging)",
+    "com.net.pvr": "PVR Cinemas (movie tickets)",
+    "cris.org.in.prs.ima": "IRCTC Rail Connect (trains)",
+    "com.android.chrome": "Chrome (browser)",
+    "com.google.android.apps.messaging": "Google Messages (SMS)",
+    "com.mi.android.globallauncher": "Home screen / app launcher",
+}
+
 # --------------------------------------------------------------------------- #
 # Intent analysis
 # --------------------------------------------------------------------------- #
@@ -134,7 +150,8 @@ def build_action_user(goal: str, facts: dict, plan_summary: str,
         f"KNOWN FACTS: {json.dumps(facts)}\n"
         f"PLAN: {plan_summary}\n"
         f"RECENT ACTIONS:\n{hist}\n"
-        f"CURRENT APP: {screen.app_package}  SCREEN: {screen.activity}\n"
+        f"CURRENT APP: {KNOWN_APPS.get(screen.app_package, screen.app_package)} "
+        f"[{screen.app_package}]  SCREEN: {screen.activity}\n"
         f"ELEMENTS (JSON): {json.dumps(elements)}{more}\n"
         + (f"VISIBLE TEXT (OCR — read from the screenshot; each has x,y as 0-1 screen "
            f"fractions you can use with tap_xy): {json.dumps(ocr_items)}\n" if ocr_items else "")

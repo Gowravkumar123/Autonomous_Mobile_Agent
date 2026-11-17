@@ -87,7 +87,10 @@ register(Skill(
         "5. Review the summary. STOP before payment."
     ),
     approval_boundary="Pause before payment; show cinema, movie, showtime, seats and total.",
-    success_markers=["booking confirmed", "ticket", "enjoy the show"],
+    # "ticket" is too generic (it appears on every movie page as "Book tickets"), which
+    # falsely completed the task. A real booking only confirms AFTER payment.
+    success_markers=["booking confirmed", "booking id", "enjoy the show", "ticket confirmed"],
+    min_actions_before_success=5,
 ))
 
 register(Skill(
