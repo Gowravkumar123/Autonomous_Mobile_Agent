@@ -21,6 +21,10 @@ class GeminiProvider(LLMProvider):
         gen_config: dict = {"temperature": temperature, "maxOutputTokens": max_tokens}
         if json_mode:
             gen_config["responseMimeType"] = "application/json"
+        # Disable 2.5's default "thinking" for our fast structured action calls — it
+        # otherwise consumes the output budget and can return an empty body.
+        if "2.5" in self.model:
+            gen_config["thinkingConfig"] = {"thinkingBudget": 0}
         parts: list = [{"text": user}]
         if image_b64:
             parts.append({"inline_data": {"mime_type": "image/jpeg", "data": image_b64}})

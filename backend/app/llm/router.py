@@ -22,11 +22,13 @@ class LLMRouter(LLMProvider):
 
     def __init__(self, settings: Settings):
         self.chain: list[LLMProvider] = []
+        # Gemini first when available: stronger UI grounding + vision than the free Groq
+        # models. Groq is the fallback, then the heuristic mock.
+        if settings.has_gemini:
+            self.chain.append(GeminiProvider(settings.gemini_api_key, settings.gemini_model))
         if settings.has_groq:
             self.chain.append(GroqProvider(settings.groq_api_key, settings.groq_model,
                                            settings.groq_vision_model))
-        if settings.has_gemini:
-            self.chain.append(GeminiProvider(settings.gemini_api_key, settings.gemini_model))
         # Mock is always last so the system is never fully down.
         self.chain.append(MockProvider())
         log.info("LLM chain: %s", " -> ".join(p.name for p in self.chain))
