@@ -25,6 +25,8 @@ class UiElement(BaseModel):
     phone uses to actually tap — the model should target by `ref`.
     """
     ref: int = Field(..., description="Stable index assigned by the serializer this frame.")
+    depth: int = Field(0, description="Nesting level in the UI tree (0 = top).")
+    parent: int = Field(-1, description="ref of the nearest kept ancestor (-1 = root); groups elements.")
     role: str = Field("", description="e.g. Button, EditText, TextView, CheckBox.")
     text: str = Field("", description="Visible text.")
     desc: str = Field("", description="contentDescription.")

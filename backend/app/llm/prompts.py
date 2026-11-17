@@ -63,6 +63,10 @@ ACTION_SYSTEM = (
     "If a SCREENSHOT image is attached, use it to understand the layout and locate controls "
     "(e.g. the search bar, buttons, items). Match what you see in the image to an element in "
     "the list and act on its `ref`.\n"
+    "Each element has `parent` (the ref of its container) and `depth`: elements sharing a "
+    "parent belong to the same group/card — e.g. a restaurant name, its price and its 'Add' "
+    "button under one parent are the same item. Use this grouping to read and compare "
+    "(e.g. which price goes with which option) and to tap the right item's control.\n"
     "Rules:\n"
     "- Target elements by their `ref` number, never by pixel coordinates.\n"
     "- Prefer filling required fields and tapping forward/confirm controls.\n"
@@ -113,7 +117,8 @@ def build_action_user(goal: str, facts: dict, plan_summary: str,
     shown = screen.elements[:max_elements]
     elements = [
         {
-            "ref": e.ref, "role": e.role, "text": clip(e.text), "desc": clip(e.desc),
+            "ref": e.ref, "parent": e.parent, "depth": e.depth,
+            "role": e.role, "text": clip(e.text), "desc": clip(e.desc),
             "resource_id": e.resource_id, "editable": e.editable,
             "clickable": e.clickable, "scrollable": e.scrollable,
             "checked": e.checked, "enabled": e.enabled,

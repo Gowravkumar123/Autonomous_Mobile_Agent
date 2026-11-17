@@ -20,7 +20,7 @@ class TreeSerializer {
     fun capture(root: AccessibilityNodeInfo?, packageName: String, activity: String): JSONObject {
         nodesByRef.clear()
         val elements = JSONArray()
-        if (root != null) walk(root, elements)
+        if (root != null) walk(root, elements, 0, -1)
         return JSONObject()
             .put("app_package", packageName)
             .put("activity", activity)
@@ -28,18 +28,25 @@ class TreeSerializer {
             .put("elements", elements)
     }
 
-    private fun walk(node: AccessibilityNodeInfo, out: JSONArray) {
-        if (!node.isVisibleToUser) {
-            // Still descend — some containers are invisible but hold visible children.
-        }
+    /**
+     * Hybrid serialization: a flat list (for stable `ref` targeting) where each element
+     * also carries `depth` and `parent` (the ref of its nearest kept ancestor). That
+     * preserves the tree's grouping — e.g. a price and a name under the same card share
+     * a parent — without losing the flat refs used for actions.
+     */
+    private fun walk(node: AccessibilityNodeInfo, out: JSONArray, depth: Int, parentRef: Int) {
+        var childDepth = depth
+        var childParent = parentRef
         if (isInteresting(node)) {
             val ref = nodesByRef.size
             nodesByRef.add(node)
-            out.put(serialize(node, ref))
+            out.put(serialize(node, ref, depth, parentRef))
+            childDepth = depth + 1
+            childParent = ref            // this node is the parent of its kept descendants
         }
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            walk(child, out)
+            walk(child, out, childDepth, childParent)
         }
     }
 
@@ -49,10 +56,12 @@ class TreeSerializer {
         return hasText || n.isClickable || n.isEditable || n.isCheckable || n.isScrollable
     }
 
-    private fun serialize(n: AccessibilityNodeInfo, ref: Int): JSONObject {
+    private fun serialize(n: AccessibilityNodeInfo, ref: Int, depth: Int, parent: Int): JSONObject {
         val bounds = Rect().also { n.getBoundsInScreen(it) }
         return JSONObject()
             .put("ref", ref)
+            .put("depth", depth)
+            .put("parent", parent)
             .put("role", role(n))
             .put("text", n.text?.toString() ?: "")
             .put("desc", n.contentDescription?.toString() ?: "")
