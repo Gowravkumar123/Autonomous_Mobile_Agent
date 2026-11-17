@@ -299,17 +299,19 @@ class AgentController:
         user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen,
                                  ocr_items=ocr)
         last_err: Exception | None = None
-        # Text-only (gpt-oss has no vision): decide from the accessibility tree (with
-        # grouping) plus OCR text+positions on sparse screens. Fast Groq calls. Retry
-        # once on an empty/garbled body before asking the user.
-        for _ in range(2):
+        # Populated screens: fast gpt-oss text call from the tree (+ grouping). Sparse
+        # screens: send the screenshot to Groq's vision model (qwen) to locate controls,
+        # falling back to text (tree + OCR) if vision errors. All on Groq, so fast.
+        use_vision = bool(screen.screenshot_b64) and len(screen.elements) <= 8
+        attempts = [screen.screenshot_b64, None] if use_vision else [None, None]
+        for image in attempts:
             try:
                 data = await self.llm.complete_json(
-                    ACTION_SYSTEM, user, temperature=0.1, max_tokens=1200)
+                    ACTION_SYSTEM, user, temperature=0.1, max_tokens=1200, image_b64=image)
                 return AgentAction(**data)
             except (LLMError, ValueError, TypeError) as e:
                 last_err = e
-                log.warning("decide failed: %s", e)
+                log.warning("decide (%s) failed: %s", "vision" if image else "text", e)
         return AgentAction(type=ActionType.ASK_USER,
                            text="I couldn't interpret the screen. What should I do next?",
                            thought=str(last_err))

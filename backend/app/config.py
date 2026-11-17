@@ -11,9 +11,9 @@ class Settings(BaseSettings):
     # LLM
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-120b"
-    # Multimodal Groq model used for action decisions when a screenshot is available.
-    # Uses the same GROQ_API_KEY. Override if Groq retires this model.
-    groq_vision_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
+    # Groq's multimodal model, used for action decisions on sparse screens when a
+    # screenshot is available (same GROQ_API_KEY, fast). Override if Groq rotates it.
+    groq_vision_model: str = "qwen/qwen3.8-27b"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
     # Gemini is OFF by default — its free tier is too slow for the per-step loop. Set
