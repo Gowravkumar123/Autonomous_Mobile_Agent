@@ -53,6 +53,14 @@ async def analyze_intent(task: Task, llm: LLMRouter) -> None:
     task.facts = normalize_facts(data.get("facts") or {})
     task.clarifications = data.get("clarifications") or []
 
+    # Did the user pre-authorize commitments? (payments still always pause.)
+    _PREAUTH = ("do it", "just do it", "go ahead", "send it", "just send", "submit it",
+                "without asking", "don't ask", "dont ask", "no confirmation",
+                "no need to confirm", "just book", "just order", "complete it",
+                "finish it", "automatically", "without confirmation")
+    low = task.prompt.lower()
+    task.pre_authorized = any(p in low for p in _PREAUTH)
+
     skill = registry.get(task.skill)
     task.app_hint = data.get("app_hint") or skill.primary_app()
 

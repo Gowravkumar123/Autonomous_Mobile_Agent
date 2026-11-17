@@ -47,6 +47,9 @@ class Task(BaseModel):
     plan: list[str] = Field(default_factory=list)
     approval_boundary: str = ""
     clarifications: list[str] = Field(default_factory=list)
+    # The user pre-authorized commitments ("do it", "send it"): skip Level-3 approval
+    # pauses. Level 4 (payment / OTP / biometric) ALWAYS pauses regardless.
+    pre_authorized: bool = False
 
     # Runtime.
     step_id: int = 0

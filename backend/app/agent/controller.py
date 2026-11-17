@@ -226,6 +226,15 @@ class AgentController:
                   action=action.type.value, allow=decision.allow)
 
             if decision.needs_approval:
+                # Pre-authorized by the user ("do it" / "send it"): proceed on an external
+                # commitment (Level 3) without pausing. Level 4 (payment/OTP/biometric)
+                # ALWAYS pauses — it can never be pre-authorized.
+                if task.pre_authorized and decision.risk_level <= 3:
+                    task.log("note", f"pre-authorized — proceeding with {action.type.value} "
+                                     f"(level {decision.risk_level})")
+                    self.store.publish(task.id, "note", "pre-authorized; not pausing")
+                    await self._act(device, action, task)
+                    continue
                 approved = await self._approval_pause(task, device, decision, action, screen)
                 if task.cancel_requested or not approved:
                     task.set_state(TaskState.CANCELLED, "user declined the sensitive step")
