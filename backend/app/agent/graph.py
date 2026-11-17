@@ -79,7 +79,19 @@ class AgentState(TypedDict, total=False):
     step: int                             # ReAct cycle counter
     last_sig: str                         # screen signature BEFORE the last action ran
     pending_validate: bool                # an action ran and awaits validation
+    opens: int                            # deterministic open_app attempts (bootstrap)
     status: str                           # run | done | failed | waiting | cancelled
+
+
+def _target_app_name(skill) -> str:
+    """Friendly app name the device resolves by launcher label (e.g. 'BookMyShow').
+
+    Falls back to the raw package if we have no friendly name for it.
+    """
+    from ..llm.prompts import KNOWN_APPS
+    pkg = skill.primary_app()
+    friendly = KNOWN_APPS.get(pkg, "")
+    return friendly.split(" (")[0] if friendly else pkg
 
 
 def _screen_sig(screen: ScreenObservation) -> str:
@@ -234,6 +246,22 @@ def build_react_graph(controller):
             task.set_state(TaskState.CANCELLED, "cancelled by user")
             return {"status": "cancelled"}
         task.set_state(TaskState.RUNNING)
+
+        # Deterministic bootstrap: if the skill targets specific apps and we are NOT in
+        # one yet (e.g. sitting on the home launcher, whose tree is sparse and whose
+        # screenshot the OEM may block), just OPEN the app instead of asking the LLM to
+        # reason about a near-blank screen. This is the #1 cause of the agent "asking
+        # instead of acting" at the start. Capped so a non-launching app can't loop.
+        opens = state.get("opens", 0)
+        if (skill.app_packages and screen.app_package not in skill.app_packages
+                and opens < 2):
+            name = _target_app_name(skill)
+            task.log("action", "open_app", thought=f"Not in the target app; opening {name}.")
+            return {"action": AgentAction(type=ActionType.OPEN_APP, text=name,
+                                          thought=f"Open {name} to begin.",
+                                          expectation=f"{name} is open"),
+                    "opens": opens + 1}
+
         action = await c._decide(task, skill, screen, feedback=state.get("feedback", ""))
         task.log("action", f"{action.type.value}", thought=action.thought)
         return {"action": action}

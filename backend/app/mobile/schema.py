@@ -11,7 +11,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # --------------------------------------------------------------------------- #
@@ -113,6 +113,17 @@ class AgentAction(BaseModel):
     # Risk metadata filled in by the policy engine (NOT trusted from the LLM).
     risk_level: int = 0
     risk_reason: str = ""
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def _coerce_options(cls, v: Any) -> list:
+        # The model emits "options": null for non-ask actions — treat as empty, and be
+        # lenient if it returns a single string instead of a list.
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v] if v.strip() else []
+        return v
 
 
 class Observation(BaseModel):

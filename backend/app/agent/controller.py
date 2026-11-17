@@ -151,7 +151,8 @@ class AgentController:
         initial_state = {
             "task": task, "skill": skill, "screen": None, "action": None,
             "feedback": "", "react_attempts": 0, "blind": 0, "disconnects": 0,
-            "step": 0, "last_sig": "", "pending_validate": False, "status": "run",
+            "step": 0, "last_sig": "", "pending_validate": False, "opens": 0,
+            "status": "run",
         }
         # recursion_limit counts node executions (~4 per ReAct cycle); the in-node
         # step cap (GRAPH_MAX_STEPS) is the real limiter — keep headroom above it.
