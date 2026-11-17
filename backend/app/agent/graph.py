@@ -83,6 +83,35 @@ class AgentState(TypedDict, total=False):
     status: str                           # run | done | failed | waiting | cancelled
 
 
+# Strong "advance the booking" CTAs. If one of these is visible and the model tries to
+# scroll past it, we tap it instead (the free model repeatedly scrolls past 'Book tickets').
+_CTA_PHRASES = (
+    "book tickets", "book now", "book ticket", "get tickets", "proceed to pay",
+    "proceed", "continue", "select seats", "select seat", "confirm booking",
+    "place order", "pay now", "pay later", "add to cart", "checkout", "book", "reserve",
+)
+
+
+def _find_cta(screen: ScreenObservation):
+    """Return a visible, clickable element that clearly advances the flow, else None.
+
+    Longer phrases win (prefer 'book tickets' over a bare 'book'), and we only match
+    reasonably short labels so a sentence that merely contains 'book' isn't tapped.
+    """
+    best = None
+    best_len = 0
+    for e in screen.elements:
+        label = f"{e.text} {e.desc}".strip().lower()
+        if not label or len(label) > 24:
+            continue
+        if not (e.clickable or e.enabled):
+            continue
+        for phrase in _CTA_PHRASES:
+            if phrase in label and len(phrase) > best_len:
+                best, best_len = e, len(phrase)
+    return best
+
+
 def _target_app_name(skill) -> str:
     """Friendly app name the device resolves by launcher label (e.g. 'BookMyShow').
 
@@ -288,6 +317,19 @@ def build_react_graph(controller):
         skill = state["skill"]
         screen: ScreenObservation = state["screen"]
         action: AgentAction = state["action"]
+
+        # ---- deterministic CTA override: never scroll past a clear 'advance' button ----
+        # The free model repeatedly scrolls past a visible 'Book tickets'/'Proceed' control;
+        # if it tries to scroll while such a button is on screen, tap the button instead.
+        if action.type == ActionType.SCROLL:
+            cta = _find_cta(screen)
+            if cta is not None:
+                task.log("note", f"override scroll → tap CTA #{cta.ref} {cta.text!r}")
+                c.store.publish(task.id, "note", f"tapping '{cta.text}' instead of scrolling")
+                action = AgentAction(type=ActionType.TAP, ref=cta.ref,
+                                     thought=f"Tapping '{cta.text}' instead of scrolling past it.",
+                                     expectation="advance to the next booking step")
+                state["action"] = action
 
         # ---- terminal / control tools ----
         if action.type == ActionType.DONE:
