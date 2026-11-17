@@ -106,6 +106,9 @@ class AgentAction(BaseModel):
     # The model's own narration — shown in the UI log and used for verification.
     thought: str = ""
     expectation: str = Field("", description="What the screen should look like if this worked.")
+    # For ASK_USER: concrete choices to offer the user (so the phone can read/show them).
+    options: list[str] = Field(default_factory=list,
+                               description="2-5 short choices to present when type=ask_user.")
 
     # Risk metadata filled in by the policy engine (NOT trusted from the LLM).
     risk_level: int = 0

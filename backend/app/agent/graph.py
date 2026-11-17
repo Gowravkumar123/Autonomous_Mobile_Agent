@@ -251,7 +251,8 @@ def build_react_graph(controller):
             task.set_state(TaskState.FAILED, task.error or "agent could not proceed")
             return {"status": "failed"}
         if action.type == ActionType.ASK_USER:
-            facts = await c._ask_user(task, [action.text or "I need more information."])
+            facts = await c._ask_user(task, [action.text or "I need more information."],
+                                      [list(action.options or [])])
             if task.cancel_requested:
                 task.set_state(TaskState.CANCELLED, "cancelled")
                 return {"status": "cancelled"}

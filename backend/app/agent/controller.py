@@ -105,7 +105,7 @@ class AgentController:
         self._emit(task)
 
         if task.clarifications:
-            facts = await self._ask_user(task, task.clarifications)
+            facts = await self._ask_user(task, task.clarifications, task.clarification_choices)
             if task.cancel_requested:
                 task.set_state(TaskState.CANCELLED, "cancelled during clarification")
                 return
@@ -228,14 +228,30 @@ class AgentController:
         self.store.publish(task.id, "approval_decided", f"approved={approved}")
         return approved
 
-    async def _ask_user(self, task: Task, questions: list[str]) -> dict:
+    @staticmethod
+    def _with_choices(question: str, options: list[str]) -> str:
+        """Bake the choices into the question so Zoro reads them aloud verbatim."""
+        opts = [o for o in (options or []) if o]
+        if not opts:
+            return question
+        tail = opts[0] if len(opts) == 1 else ", ".join(opts[:-1]) + ", or " + opts[-1]
+        return f"{question} Choose one: {tail}."
+
+    async def _ask_user(self, task: Task, questions: list[str],
+                        choices: list[list[str]] | None = None) -> dict:
+        choices = choices or []
+        # Compose each question WITH its options (spoken + displayed), and pass the raw
+        # choices through so the phone can render tappable buttons as well.
+        composed = [self._with_choices(q, choices[i] if i < len(choices) else [])
+                    for i, q in enumerate(questions)]
         task.set_state(TaskState.WAITING_FOR_USER, "needs clarification")
-        self.store.publish(task.id, "ask_user", " | ".join(questions), questions=questions)
-        audit(task.id, "ask_user", " | ".join(questions))
+        self.store.publish(task.id, "ask_user", " | ".join(composed),
+                           questions=composed, choices=choices)
+        audit(task.id, "ask_user", " | ".join(composed))
         # Surface the question(s) to the paired device/companion UI so the user can answer.
         device = self.devices.get(task.device_id) or self.devices.any()
         if device:
-            await device.push("ask_user", task_id=task.id, questions=questions)
+            await device.push("ask_user", task_id=task.id, questions=composed, choices=choices)
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._answers[task.id] = fut
         facts = await fut

@@ -37,7 +37,10 @@ INTENT_SYSTEM = (
     "that are strictly required before you could begin. Reply as JSON with keys: "
     '`goal` (str), `app_hint` (str package or app name or ""), `skill` (one of: '
     "train, food, movie, messaging, generic), `facts` (object of field->value), "
-    "`clarifications` (array of strings).\n"
+    "`clarifications` (array of objects, each `{\"question\": str, \"choices\": [str, ...]}`).\n"
+    "For EVERY clarification, ALWAYS give 2-5 short, concrete `choices` the user can pick "
+    "from, and include a sensible default such as \"Any (you choose)\" as one choice. Ask "
+    "ONLY what is strictly required to begin; prefer deciding yourself over asking.\n"
     "Use these canonical snake_case fact keys where they apply: `from`, `to`, `date`, "
     "`passengers`, `class`, `item`, `to_contact`, `message`. Do not invent synonyms "
     "(e.g. use `from` not `origin`, `date` not `travel_date`, `passengers` not `ticket_count`)."
@@ -129,10 +132,13 @@ ACTION_SYSTEM = (
     "at the CENTER of that control. Prefer tapping a real element `ref` when one exists; use "
     "`tap_xy` as the fallback for empty/sparse screens.\n"
     "- If you are stuck or a required detail is truly missing, choose `ask_user` (put the question "
-    "in `text`) or `fail`.\n"
+    "in `text`) or `fail`. When you `ask_user`, ALWAYS fill `options` with 2-5 short, concrete "
+    "choices read off the current screen (e.g. the actual showtimes/seats/prices visible), so the "
+    "user can pick one by voice — include a sensible default like \"Any (you choose)\".\n"
     "Reply as JSON with keys: `type` (tap|tap_xy|type|enter|scroll|swipe|back|home|open_app|wait|"
     "ask_user|approve|done|fail), `ref` (int|null), `x` (0-1 or null), `y` (0-1 or null), `text` (str|null), "
-    "`direction` (up|down|left|right|null), `seconds` (num|null), `thought` (str), `expectation` (str)."
+    "`direction` (up|down|left|right|null), `seconds` (num|null), `options` (array of strings, for "
+    "ask_user), `thought` (str), `expectation` (str)."
 )
 
 

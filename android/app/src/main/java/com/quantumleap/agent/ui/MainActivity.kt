@@ -216,7 +216,20 @@ class MainActivity : AppCompatActivity() {
         if (question != null) {
             val q = question.optJSONArray("questions")?.optString(0) ?: "The agent needs more info."
             panel.addView(TextView(this).apply { text = "❓ $q"; setPadding(0, 16, 0, 8) })
-            val answer = EditText(this).apply { hint = "Type an answer (or use the mic above)" }
+            // Tappable choices (Zoro also reads them aloud and accepts a spoken answer).
+            val choices0 = question.optJSONArray("choices")?.optJSONArray(0)
+            if (choices0 != null) {
+                for (i in 0 until choices0.length()) {
+                    val opt = choices0.optString(i)
+                    if (opt.isNotBlank()) panel.addView(Button(this).apply {
+                        text = opt
+                        setOnClickListener {
+                            svc.answerClarification(opt); ui.postDelayed({ moveTaskToBack(true) }, 400)
+                        }
+                    })
+                }
+            }
+            val answer = EditText(this).apply { hint = "Or type / use the mic above" }
             panel.addView(answer)
             panel.addView(Button(this).apply {
                 text = "Send answer"

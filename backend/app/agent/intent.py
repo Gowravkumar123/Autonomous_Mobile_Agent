@@ -51,7 +51,22 @@ async def analyze_intent(task: Task, llm: LLMRouter) -> None:
     task.goal = data.get("goal") or task.prompt
     task.skill = (data.get("skill") or "generic").strip().lower()
     task.facts = normalize_facts(data.get("facts") or {})
-    task.clarifications = data.get("clarifications") or []
+
+    # Clarifications may be plain strings or {question, choices} objects. Normalize to
+    # parallel lists: question text + its concrete choices (so the phone can offer them).
+    questions: list[str] = []
+    choices: list[list[str]] = []
+    for c in (data.get("clarifications") or []):
+        if isinstance(c, dict):
+            q = str(c.get("question") or "").strip()
+            ch = [str(x).strip() for x in (c.get("choices") or []) if str(x).strip()]
+        else:
+            q, ch = str(c).strip(), []
+        if q:
+            questions.append(q)
+            choices.append(ch)
+    task.clarifications = questions
+    task.clarification_choices = choices
 
     # Did the user pre-authorize commitments? (payments still always pause.)
     _PREAUTH = ("do it", "just do it", "go ahead", "send it", "just send", "submit it",
@@ -68,6 +83,7 @@ async def analyze_intent(task: Task, llm: LLMRouter) -> None:
     for req in skill.required_facts:
         if not task.facts.get(req) and req not in " ".join(task.clarifications).lower():
             task.clarifications.append(f"What is the {req.replace('_', ' ')}?")
+            task.clarification_choices.append([])
 
     task.log("note", "intent analyzed", skill=task.skill, app=task.app_hint,
              facts=task.facts, clarifications=task.clarifications)
