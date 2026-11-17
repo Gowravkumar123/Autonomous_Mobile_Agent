@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     # Groq's multimodal model, used for action decisions on sparse screens when a
     # screenshot is available (same GROQ_API_KEY, fast). Override if Groq rotates it.
     groq_vision_model: str = "qwen/qwen3.8-27b"
+    # Groq voice models for the assistant (same GROQ_API_KEY).
+    groq_tts_model: str = "playai-tts"
+    groq_tts_voice: str = "Fritz-PlayAI"
+    groq_stt_model: str = "whisper-large-v3"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
     # Gemini is OFF by default — its free tier is too slow for the per-step loop. Set

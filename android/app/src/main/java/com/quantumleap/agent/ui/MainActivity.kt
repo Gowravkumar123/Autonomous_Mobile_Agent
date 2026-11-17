@@ -100,13 +100,42 @@ class MainActivity : AppCompatActivity() {
         })
         root.addView(row)
 
-        // --- voice (push-to-talk) ---
-        root.addView(TextView(this).apply {
-            text = "3 · Voice: tap 🎤 Speak above, or pull down the notification and tap " +
-                   "\"Speak\", then say your command. Zoro speaks its questions and takes " +
-                   "your spoken answer."
-            setPadding(0, 24, 0, 8)
+        root.addView(Button(this).apply {
+            text = "⛔  STOP the agent"
+            setOnClickListener { stopAll() }
         })
+
+        // --- voice ---
+        val prefs = getSharedPreferences("agent", MODE_PRIVATE)
+        root.addView(TextView(this).apply {
+            text = "3 · Voice"; textSize = 18f; setPadding(0, 24, 0, 4)
+        })
+        root.addView(TextView(this).apply {
+            text = "Push-to-talk: tap 🎤 Speak above (or the notification's Speak). " +
+                   "Hands-free wake word (\"Jarvis\", or \"Hey Zoro\" if a custom keyword is " +
+                   "bundled) needs a free Picovoice AccessKey from console.picovoice.ai:"
+            setPadding(0, 0, 0, 8)
+        })
+        val keyField = EditText(this).apply {
+            hint = "Picovoice AccessKey"
+            setText(prefs.getString("pv_key", ""))
+        }
+        root.addView(keyField)
+        val wakeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        wakeRow.addView(Button(this).apply {
+            text = "Enable wake word"
+            setOnClickListener {
+                if (!hasMic()) { ensureMicPermission(); return@setOnClickListener }
+                prefs.edit().putString("pv_key", keyField.text.toString().trim()).apply()
+                AgentForegroundService.wakeOn(this@MainActivity)
+                toast("Wake word starting…")
+            }
+        })
+        wakeRow.addView(Button(this).apply {
+            text = "Disable"
+            setOnClickListener { AgentForegroundService.wakeOff(this@MainActivity); toast("Wake word off") }
+        })
+        root.addView(wakeRow)
 
         status = TextView(this).apply { text = "Status: idle"; setPadding(0, 32, 0, 16) }
         root.addView(status)
@@ -135,6 +164,17 @@ class MainActivity : AppCompatActivity() {
             }
             override fun onResponse(call: Call, response: Response) {
                 response.close(); ui.post { speak("Starting."); toast("Task started") }
+            }
+        })
+    }
+
+    private fun stopAll() {
+        val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/stop")
+            .post("".toRequestBody("application/json".toMediaType())).build()
+        http.newCall(req).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) { ui.post { toast("Couldn't reach server") } }
+            override fun onResponse(call: Call, response: Response) {
+                response.close(); ui.post { toast("Stopped"); speak("Stopped.") }
             }
         })
     }

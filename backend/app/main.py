@@ -5,7 +5,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -112,6 +112,36 @@ async def answer(task_id: str, body: Answer):
 async def cancel(task_id: str):
     app.state.controller.cancel(task_id)
     return {"ok": True}
+
+
+@app.post("/stop")
+async def stop_all():
+    """Emergency stop: cancel every task that isn't already finished."""
+    from .agent.state import TERMINAL
+    stopped = 0
+    for t in app.state.store.all():
+        if t.state not in TERMINAL:
+            app.state.controller.cancel(t.id)
+            stopped += 1
+    return {"stopped": stopped}
+
+
+@app.post("/voice/tts")
+async def voice_tts(body: dict):
+    """Text -> speech (WAV) via Groq PlayAI. 503 if unavailable (phone falls back)."""
+    from .voice.groq_audio import tts
+    audio = await tts(body.get("text", ""))
+    if not audio:
+        return Response(status_code=503)
+    return Response(content=audio, media_type="audio/wav")
+
+
+@app.post("/voice/stt")
+async def voice_stt(file: UploadFile = File(...)):
+    """Speech -> text via Groq Whisper."""
+    from .voice.groq_audio import stt
+    text = await stt(await file.read(), file.filename or "audio.wav")
+    return {"text": text}
 
 
 def _task_view(task: Task, full: bool = False) -> dict:

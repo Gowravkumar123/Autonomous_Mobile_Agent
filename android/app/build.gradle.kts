@@ -44,5 +44,8 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
+    // On-device wake word ("Hey Zoro" / built-in "Jarvis") — needs a free Picovoice key.
+    implementation("ai.picovoice:porcupine-android:3.0.1")
+
     // JSON parsing/serialization uses org.json, which ships with the Android SDK.
 }

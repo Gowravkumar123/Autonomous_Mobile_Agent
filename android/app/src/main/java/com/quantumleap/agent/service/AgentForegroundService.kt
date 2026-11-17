@@ -1,5 +1,8 @@
 package com.quantumleap.agent.service
 
+import ai.picovoice.porcupine.Porcupine
+import ai.picovoice.porcupine.PorcupineManager
+import ai.picovoice.porcupine.PorcupineManagerCallback
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -28,17 +31,19 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
 import java.util.Locale
 
 /**
- * Foreground service: keeps the process alive and handles voice by PUSH-TO-TALK.
+ * Foreground service: keeps the process alive, runs an on-device WAKE WORD (Picovoice
+ * Porcupine — low-power, no SpeechRecognizer loop), and handles voice commands + the
+ * task's spoken Q&A. Porcupine and the SpeechRecognizer never hold the mic at once:
+ * Porcupine is paused for each single-shot recognition and resumed after.
  *
- * Why not always-on "Hi Zoro": Android's SpeechRecognizer has no real hotword mode — it
- * can only be restarted in a tight loop that never stops, beeps, and drains battery. So
- * instead the persistent notification has a "Speak" action: tap it (or the app mic),
- * say one command, done. Each listen is a single shot — no loop. A true wake word needs
- * a dedicated engine (e.g. Picovoice Porcupine).
+ * Wake word: a custom "Hey Zoro" keyword if `assets/zoro.ppn` is bundled, otherwise the
+ * built-in "Jarvis". Needs a free Picovoice AccessKey (set in the app). Falls back to
+ * push-to-talk (the notification "Speak" action) if no key / Porcupine can't start.
  */
 class AgentForegroundService : Service() {
 
@@ -47,7 +52,10 @@ class AgentForegroundService : Service() {
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var recognizer: SpeechRecognizer? = null
-    @Volatile private var busy = false
+    private var player: android.media.MediaPlayer? = null
+
+    private var porcupine: PorcupineManager? = null
+    @Volatile private var wakeWanted = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -59,11 +67,14 @@ class AgentForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForegroundSafely()
         when (intent?.action) {
-            ACTION_LISTEN -> startCommandListen()
-            ACTION_ASK -> handleQuestion(intent.getStringExtra(EXTRA_PROMPT) ?: "I need more information.") { a ->
+            ACTION_WAKE_ON -> { wakeWanted = true; startWake(spoken = true) }
+            ACTION_WAKE_OFF -> { wakeWanted = false; stopWake() }
+            ACTION_LISTEN -> { pauseWake(); speakThen("Listening") { listenCommand(0) } }
+            ACTION_STOP -> stopTasks()
+            ACTION_ASK -> { pauseWake(); handleQuestion(intent.getStringExtra(EXTRA_PROMPT) ?: "I need more information.") { a ->
                 AgentAccessibilityService.instance?.answerClarification(a)
-            }
-            ACTION_APPROVE -> handleQuestion(
+            } }
+            ACTION_APPROVE -> { pauseWake(); handleQuestion(
                 (intent.getStringExtra(EXTRA_PROMPT) ?: "Approval needed.") +
                     ". Say approve to continue, or decline.") { a ->
                 val l = a.lowercase()
@@ -74,29 +85,74 @@ class AgentForegroundService : Service() {
                         AgentAccessibilityService.instance?.answerApproval(false)
                     else -> speak("I didn't catch that; please decide in the app.")
                 }
-            }
+            } }
         }
         return START_STICKY
     }
 
-    override fun onDestroy() { destroyRecognizer(); tts?.shutdown(); super.onDestroy() }
+    override fun onDestroy() { stopWake(); destroyRecognizer(); releasePlayer(); tts?.shutdown(); super.onDestroy() }
 
-    // ------------------------------------------------------------------ //
-    private fun startCommandListen() {
-        if (busy) return
-        speakThen("Listening") { listenCommand(0) }
+    // ---------------- wake word (Porcupine) ---------------- //
+    private fun accessKey(): String =
+        getSharedPreferences("agent", Context.MODE_PRIVATE).getString("pv_key", "") ?: ""
+
+    private fun startWake(spoken: Boolean = false) {
+        if (!wakeWanted) return
+        val key = accessKey()
+        if (key.isBlank()) { if (spoken) speak("Add your Picovoice key first."); return }
+        if (porcupine != null) return
+        try {
+            val builder = PorcupineManager.Builder().setAccessKey(key).setSensitivity(0.6f)
+            val custom = customKeywordPath()
+            if (custom != null) builder.setKeywordPath(custom)
+            else builder.setKeyword(Porcupine.BuiltInKeyword.JARVIS)
+            porcupine = builder.build(applicationContext,
+                PorcupineManagerCallback { _ -> main.post { onWakeDetected() } })
+            porcupine?.start()
+            updateNotification(listening = true)
+            if (spoken) speak(if (custom != null) "Say hey Zoro." else "Say Jarvis.")
+            Log.i(TAG, "wake word on (${if (custom != null) "Hey Zoro" else "Jarvis"})")
+        } catch (e: Exception) {
+            Log.w(TAG, "Porcupine start failed: ${e.message}")
+            porcupine = null
+            if (spoken) speak("Wake word could not start; use the Speak button.")
+        }
     }
 
+    /** Release Porcupine's mic without clearing the wake preference (so we can resume). */
+    private fun pauseWake() {
+        try { porcupine?.stop(); porcupine?.delete() } catch (_: Exception) {}
+        porcupine = null
+    }
+
+    private fun stopWake() { pauseWake(); updateNotification(listening = false) }
+
+    private fun resumeWake() { if (wakeWanted) main.postDelayed({ startWake() }, 400) }
+
+    private fun customKeywordPath(): String? = try {
+        val f = File(filesDir, "zoro.ppn")
+        if (!f.exists()) assets.open("zoro.ppn").use { inp -> f.outputStream().use { inp.copyTo(it) } }
+        f.absolutePath
+    } catch (e: Exception) { null }   // no custom keyword bundled -> use built-in
+
+    private fun onWakeDetected() {
+        pauseWake()
+        speakThen("Yes?") { listenCommand(0) }
+    }
+
+    // ---------------- voice flows ---------------- //
     private fun listenCommand(attempt: Int) {
         listenOnce(
             onResult = { runCommand(it) },
-            onFail = { if (attempt < 1) listenCommand(attempt + 1) else speak("I didn't catch that.") })
+            onFail = {
+                if (attempt < 1) listenCommand(attempt + 1)
+                else { speak("I didn't catch that."); resumeWake() }
+            })
     }
 
     private fun runCommand(command: String) {
-        if (command.isBlank()) return
-        createTask(command)
-        speak("On it.")
+        if (command.isNotBlank()) { createTask(command); speak("On it.") }
+        resumeWake()
     }
 
     private fun handleQuestion(question: String, onAnswer: (String) -> Unit) {
@@ -105,14 +161,14 @@ class AgentForegroundService : Service() {
 
     private fun listenAnswer(question: String, onAnswer: (String) -> Unit, attempt: Int) {
         listenOnce(
-            onResult = { onAnswer(it) },
+            onResult = { onAnswer(it); resumeWake() },
             onFail = {
                 if (attempt < 1) listenAnswer(question, onAnswer, attempt + 1)
-                else speak("I didn't catch that; you can answer in the app.")
+                else { speak("I didn't catch that; you can answer in the app."); resumeWake() }
             })
     }
 
-    // ------------------------------------------------------------------ //
+    // ---------------- helpers ---------------- //
     private fun createTask(prompt: String) {
         val body = JSONObject().put("prompt", prompt).toString()
             .toRequestBody("application/json".toMediaType())
@@ -125,9 +181,49 @@ class AgentForegroundService : Service() {
         })
     }
 
-    private fun speak(text: String) { if (ttsReady) tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u") }
+    private fun stopTasks() {
+        val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/stop")
+            .post("".toRequestBody("application/json".toMediaType())).build()
+        http.newCall(req).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {}
+            override fun onResponse(call: Call, response: Response) { response.close(); main.post { speak("Stopped.") } }
+        })
+    }
 
+    private fun speak(text: String) = speakThen(text) {}
+
+    /** Speak via Groq TTS (nicer voice); fall back to the device TTS on any failure. */
     private fun speakThen(text: String, after: () -> Unit) {
+        val body = JSONObject().put("text", text).toString()
+            .toRequestBody("application/json".toMediaType())
+        val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/voice/tts").post(body).build()
+        http.newCall(req).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) { main.post { androidSpeakThen(text, after) } }
+            override fun onResponse(call: Call, response: Response) {
+                val bytes = if (response.isSuccessful) response.body?.bytes() else null
+                response.close()
+                main.post {
+                    if (bytes == null || bytes.isEmpty()) androidSpeakThen(text, after)
+                    else playAudio(bytes, onDone = after, onFail = { androidSpeakThen(text, after) })
+                }
+            }
+        })
+    }
+
+    private fun playAudio(bytes: ByteArray, onDone: () -> Unit, onFail: () -> Unit) {
+        try {
+            val f = File(cacheDir, "tts.wav"); f.writeBytes(bytes)
+            releasePlayer()
+            player = android.media.MediaPlayer().apply {
+                setDataSource(f.absolutePath)
+                setOnCompletionListener { main.post(onDone) }
+                setOnErrorListener { _, _, _ -> main.post(onFail); true }
+                prepare(); start()
+            }
+        } catch (e: Exception) { onFail() }
+    }
+
+    private fun androidSpeakThen(text: String, after: () -> Unit) {
         val t = tts
         if (t == null || !ttsReady) { main.post(after); return }
         t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
@@ -138,12 +234,12 @@ class AgentForegroundService : Service() {
         t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "say")
     }
 
-    /** One single-shot recognizer at a time. No looping. */
+    private fun releasePlayer() { try { player?.release() } catch (_: Exception) {}; player = null }
+
     private fun listenOnce(onResult: (String) -> Unit, onFail: () -> Unit) {
         destroyRecognizer()
-        busy = true
         main.postDelayed({
-            if (!SpeechRecognizer.isRecognitionAvailable(this)) { busy = false; onFail(); return@postDelayed }
+            if (!SpeechRecognizer.isRecognitionAvailable(this)) { onFail(); return@postDelayed }
             val r = SpeechRecognizer.createSpeechRecognizer(this)
             recognizer = r
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -152,12 +248,11 @@ class AgentForegroundService : Service() {
             }
             r.setRecognitionListener(object : RecognitionListener {
                 override fun onResults(results: Bundle?) {
-                    busy = false
                     val best = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
                     destroyRecognizer()
                     if (best.isNullOrBlank()) onFail() else onResult(best)
                 }
-                override fun onError(error: Int) { busy = false; destroyRecognizer(); onFail() }
+                override fun onError(error: Int) { destroyRecognizer(); onFail() }
                 override fun onReadyForSpeech(p: Bundle?) {}
                 override fun onBeginningOfSpeech() {}
                 override fun onEndOfSpeech() {}
@@ -166,7 +261,7 @@ class AgentForegroundService : Service() {
                 override fun onPartialResults(p: Bundle?) {}
                 override fun onEvent(t: Int, p: Bundle?) {}
             })
-            try { r.startListening(intent) } catch (e: Exception) { busy = false; onFail() }
+            try { r.startListening(intent) } catch (e: Exception) { onFail() }
         }, 300)
     }
 
@@ -175,28 +270,44 @@ class AgentForegroundService : Service() {
         recognizer = null
     }
 
-    private fun startForegroundSafely() {
+    // ---------------- notification ---------------- //
+    private fun updateNotification(listening: Boolean) {
+        try {
+            getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification(listening))
+        } catch (_: Exception) {}
+    }
+
+    private fun buildNotification(listening: Boolean): Notification {
         val channelId = "agent_fg"
-        val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            nm.createNotificationChannel(
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
                 NotificationChannel(channelId, "Agent", NotificationManager.IMPORTANCE_LOW))
         }
         val listenPI = PendingIntent.getService(
             this, 1, Intent(this, AgentForegroundService::class.java).setAction(ACTION_LISTEN),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val notif: Notification = Notification.Builder(this, channelId)
+        val stopPI = PendingIntent.getService(
+            this, 2, Intent(this, AgentForegroundService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        return Notification.Builder(this, channelId)
             .setContentTitle("OnePiece")
-            .setContentText("Tap Speak to give a voice command")
+            .setContentText(if (listening) "Wake word on — say the word, or tap Speak"
+                            else "Tap Speak to give a voice command")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .addAction(Notification.Action.Builder(
                 android.R.drawable.ic_btn_speak_now, "🎤 Speak", listenPI).build())
+            .addAction(Notification.Action.Builder(
+                android.R.drawable.ic_delete, "⛔ Stop", stopPI).build())
             .build()
+    }
+
+    private fun startForegroundSafely() {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-            else startForeground(NOTIF_ID, notif)
+                startForeground(NOTIF_ID, buildNotification(porcupine != null),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            else startForeground(NOTIF_ID, buildNotification(porcupine != null))
         } catch (e: Exception) { Log.w(TAG, "startForeground failed", e) }
     }
 
@@ -206,12 +317,17 @@ class AgentForegroundService : Service() {
         const val ACTION_ASK = "com.quantumleap.agent.ASK"
         const val ACTION_APPROVE = "com.quantumleap.agent.APPROVE"
         const val ACTION_LISTEN = "com.quantumleap.agent.LISTEN"
+        const val ACTION_STOP = "com.quantumleap.agent.STOP"
+        const val ACTION_WAKE_ON = "com.quantumleap.agent.WAKE_ON"
+        const val ACTION_WAKE_OFF = "com.quantumleap.agent.WAKE_OFF"
         const val EXTRA_PROMPT = "prompt"
 
         fun keepAlive(ctx: Context) = start(ctx, null, null)
         fun askUser(ctx: Context, q: String) = start(ctx, ACTION_ASK, q)
         fun requestApproval(ctx: Context, s: String) = start(ctx, ACTION_APPROVE, s)
         fun listen(ctx: Context) = start(ctx, ACTION_LISTEN, null)
+        fun wakeOn(ctx: Context) = start(ctx, ACTION_WAKE_ON, null)
+        fun wakeOff(ctx: Context) = start(ctx, ACTION_WAKE_OFF, null)
 
         private fun start(ctx: Context, action: String?, prompt: String?) {
             val i = Intent(ctx, AgentForegroundService::class.java).apply {
