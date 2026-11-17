@@ -22,6 +22,7 @@ class ActionExecutor(private val service: AccessibilityService) {
             "tap" -> tap(node(action.ref, nodesByRef))
             "tap_xy" -> tapXY(action.x, action.y)
             "type" -> type(node(action.ref, nodesByRef), action.text ?: "")
+            "enter" -> imeEnter(nodesByRef)
             "scroll" -> scroll(action.direction ?: "down", nodesByRef)
             "swipe" -> swipe(action.direction ?: "up")
             "back" -> service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
@@ -43,6 +44,20 @@ class ActionExecutor(private val service: AccessibilityService) {
         val px = (x.coerceIn(0.0, 1.0) * dm.widthPixels).toFloat()
         val py = (y.coerceIn(0.0, 1.0) * dm.heightPixels).toFloat()
         return tapAt(px, py)
+    }
+
+    /** Press the keyboard's Go/Search/Enter (IME action) on the focused editable field
+     *  — submits a search or form without needing to find a 'Go' button. */
+    private fun imeEnter(nodes: List<AccessibilityNodeInfo>): Boolean {
+        val target = nodes.firstOrNull { it.isFocused && it.isEditable }
+            ?: nodes.firstOrNull { it.isEditable } ?: return false
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            if (target.performAction(
+                    AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)) return true
+        }
+        // Fallback: a tap gesture on the on-screen keyboard's enter is not reliable,
+        // so try the node's default click as a last resort.
+        return target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
     }
 
     private fun tap(node: AccessibilityNodeInfo?): Boolean {

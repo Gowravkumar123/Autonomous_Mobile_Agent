@@ -78,6 +78,7 @@ class ActionType(str, Enum):
     TAP = "tap"
     TAP_XY = "tap_xy"      # tap a point (normalized x/y) when no element ref is available
     TYPE = "type"
+    ENTER = "enter"        # press the keyboard Go/Search/Enter to submit the current field
     SCROLL = "scroll"
     SWIPE = "swipe"
     BACK = "back"

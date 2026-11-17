@@ -78,6 +78,9 @@ ACTION_SYSTEM = (
     "- Use the PLAIN in-app search box, not an AI-assistant one. Avoid fields/buttons "
     "labelled like 'Ask AI', 'Ask Meta AI', 'AI search' or a chat assistant — pick the "
     "normal search (a magnifier icon or a 'Search for…' field).\n"
+    "- After you TYPE a query into a search box or address bar, SUBMIT it with action "
+    "`enter` (presses the keyboard Go/Search). Do NOT hunt for a separate 'Go' button or "
+    "re-tap the field — use `enter` once.\n"
     "- NEVER type OTPs, PINs, passwords, card numbers or CVVs. If a screen asks for those, "
     "or is a payment/UPI screen, choose action type `approve` and hand control to the user.\n"
     "- If the goal looks complete (confirmation, booking reference, order placed), choose `done`.\n"
@@ -93,8 +96,8 @@ ACTION_SYSTEM = (
     "`tap_xy` as the fallback for empty/sparse screens.\n"
     "- If you are stuck or a required detail is truly missing, choose `ask_user` (put the question "
     "in `text`) or `fail`.\n"
-    "Reply as JSON with keys: `type` (tap|tap_xy|type|scroll|swipe|back|home|open_app|wait|ask_user|"
-    "approve|done|fail), `ref` (int|null), `x` (0-1 or null), `y` (0-1 or null), `text` (str|null), "
+    "Reply as JSON with keys: `type` (tap|tap_xy|type|enter|scroll|swipe|back|home|open_app|wait|"
+    "ask_user|approve|done|fail), `ref` (int|null), `x` (0-1 or null), `y` (0-1 or null), `text` (str|null), "
     "`direction` (up|down|left|right|null), `seconds` (num|null), `thought` (str), `expectation` (str)."
 )
 
