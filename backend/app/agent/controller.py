@@ -287,7 +287,7 @@ class AgentController:
         # When the accessibility tree is sparse/empty but we have a screenshot, OCR the
         # image so the agent can READ names/prices (and tap them) via tap_xy.
         ocr: list[dict] = []
-        if screen.screenshot_b64 and len(screen.elements) <= 6:
+        if screen.screenshot_b64 and len(screen.elements) <= 10:
             from ..vision.ocr import available, ocr_items
             ocr = await asyncio.get_event_loop().run_in_executor(
                 None, ocr_items, screen.screenshot_b64)
@@ -299,20 +299,17 @@ class AgentController:
         user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen,
                                  ocr_items=ocr)
         last_err: Exception | None = None
-        # Tree-first for speed: sending a screenshot to the model every step is slow
-        # (especially Gemini free tier). Use vision ONLY when the accessibility tree is
-        # sparse (few elements) — that's where the screenshot actually adds value; for
-        # populated screens the tree (with grouping) is enough and far faster.
-        use_vision = bool(screen.screenshot_b64) and len(screen.elements) <= 8
-        attempts = [screen.screenshot_b64, None] if use_vision else [None, None]
-        for image in attempts:
+        # Text-only (gpt-oss has no vision): decide from the accessibility tree (with
+        # grouping) plus OCR text+positions on sparse screens. Fast Groq calls. Retry
+        # once on an empty/garbled body before asking the user.
+        for _ in range(2):
             try:
                 data = await self.llm.complete_json(
-                    ACTION_SYSTEM, user, temperature=0.1, max_tokens=1500, image_b64=image)
+                    ACTION_SYSTEM, user, temperature=0.1, max_tokens=1200)
                 return AgentAction(**data)
             except (LLMError, ValueError, TypeError) as e:
                 last_err = e
-                log.warning("decide (%s) failed: %s", "vision" if image else "text", e)
+                log.warning("decide failed: %s", e)
         return AgentAction(type=ActionType.ASK_USER,
                            text="I couldn't interpret the screen. What should I do next?",
                            thought=str(last_err))

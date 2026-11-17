@@ -15,9 +15,10 @@ class Settings(BaseSettings):
     # Uses the same GROQ_API_KEY. Override if Groq retires this model.
     groq_vision_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     gemini_api_key: str = ""
-    # Current free-tier Flash model (older gemini-2.0/2.5-flash are retired). The Gemini
-    # API's own 404 message names the latest; update here if it rotates again.
     gemini_model: str = "gemini-3.8-flash"
+    # Gemini is OFF by default — its free tier is too slow for the per-step loop. Set
+    # USE_GEMINI=true to add it as a fallback after Groq.
+    use_gemini: bool = False
 
     # Server
     host: str = "0.0.0.0"

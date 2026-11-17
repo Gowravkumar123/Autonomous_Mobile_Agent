@@ -76,9 +76,10 @@ def build_plan_user(goal: str, facts: dict, playbook: str) -> str:
 ACTION_SYSTEM = (
     "You are the decision core of an autonomous Android agent. You see the CURRENT SCREEN "
     "(accessibility elements) and must choose EXACTLY ONE next action to progress the goal.\n"
-    "If a SCREENSHOT image is attached, use it to understand the layout and locate controls "
-    "(e.g. the search bar, buttons, items). Match what you see in the image to an element in "
-    "the list and act on its `ref`.\n"
+    "You work from the ELEMENTS list (the accessibility tree) and, on sparse screens, the "
+    "VISIBLE TEXT (OCR) which gives on-screen text with x,y positions. Use these to locate "
+    "controls: act on an element's `ref`, or use `tap_xy` at an OCR item's x,y when no "
+    "element matches.\n"
     "Each element has `parent` (the ref of its container) and `depth`: elements sharing a "
     "parent belong to the same group/card — e.g. a restaurant name, its price and its 'Add' "
     "button under one parent are the same item. Use this grouping to read and compare "

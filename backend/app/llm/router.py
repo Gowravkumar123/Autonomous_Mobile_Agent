@@ -1,8 +1,9 @@
 """
-LLM router: Groq (primary) -> Gemini Flash (backup) -> heuristic mock.
+LLM router — Groq (gpt-oss) first, heuristic mock as the last-resort fallback.
 
-Any single request that fails on the primary is retried on the next provider, so a
-Groq rate-limit or outage degrades gracefully instead of killing a task.
+Gemini is only used if explicitly enabled (USE_GEMINI=true); by default it is OFF because
+its free tier is too slow for a real-time per-step action loop. The agent runs on Groq's
+fast gpt-oss model, reading the screen from the accessibility tree + OCR (no LLM vision).
 """
 from __future__ import annotations
 
@@ -22,15 +23,12 @@ class LLMRouter(LLMProvider):
 
     def __init__(self, settings: Settings):
         self.chain: list[LLMProvider] = []
-        # Gemini first when available: stronger UI grounding + vision than the free Groq
-        # models. Groq is the fallback, then the heuristic mock.
-        if settings.has_gemini:
-            self.chain.append(GeminiProvider(settings.gemini_api_key, settings.gemini_model))
         if settings.has_groq:
             self.chain.append(GroqProvider(settings.groq_api_key, settings.groq_model,
                                            settings.groq_vision_model))
-        # Mock is always last so the system is never fully down.
-        self.chain.append(MockProvider())
+        if settings.has_gemini and settings.use_gemini:
+            self.chain.append(GeminiProvider(settings.gemini_api_key, settings.gemini_model))
+        self.chain.append(MockProvider())  # never fully down
         log.info("LLM chain: %s", " -> ".join(p.name for p in self.chain))
 
     @property
@@ -48,5 +46,8 @@ class LLMRouter(LLMProvider):
         raise LLMError(f"All providers failed: {last}")
 
     async def complete_json(self, system: str, user: str, **kw) -> dict:
-        raw = await self.complete(system, user, json_mode=True, **kw)
-        return extract_json(raw)
+        return extract_json(await self.complete(system, user, json_mode=True, **kw))
+
+    # Back-compat: the action loop may call this; it's the same fast Groq-first chain.
+    async def complete_json_fast(self, system: str, user: str, **kw) -> dict:
+        return await self.complete_json(system, user, **kw)
