@@ -42,6 +42,15 @@ class AgentController:
         self.memory = memory
         self._approvals: dict[str, asyncio.Future] = {}
         self._answers: dict[str, asyncio.Future] = {}
+        self._graph = None  # compiled lazily (imports langgraph on first run)
+
+    @property
+    def graph(self):
+        """The compiled LangGraph ReAct state machine (built once, reused)."""
+        if self._graph is None:
+            from .graph import build_react_graph
+            self._graph = build_react_graph(self)
+        return self._graph
 
     # ----------------------------------------------------------------- #
     # Public: resolve pauses (called by REST endpoints or inbound ws).
@@ -104,163 +113,28 @@ class AgentController:
             task.clarifications = []
 
     async def _execute_phase(self, task: Task) -> None:
+        """Run the task through the LangGraph ReAct state machine.
+
+        All per-step logic (observe -> validate/reflect -> reason -> act) lives in
+        app/agent/graph.py; this just seeds the shared AgentState and drives it. The
+        nodes mutate `task` in place (state, history, events), so the outcome is read
+        straight off `task` once the graph reaches END.
+        """
+        from .graph import MAX_STEPS as GRAPH_MAX_STEPS
+
         skill = registry.get(task.skill)
         task.set_state(TaskState.RUNNING)
         self._emit(task)
 
-        blind = 0        # consecutive screens with neither a tree nor a screenshot (secure/loading)
-        disconnects = 0  # consecutive device disconnects (OEM battery kills); we wait and retry
-        for step in range(MAX_STEPS):
-            if task.cancel_requested:
-                task.set_state(TaskState.CANCELLED, "cancelled by user")
-                break
-
-            # Re-fetch the device each step: the phone can drop and reconnect mid-task
-            # (aggressive OEM battery management), which replaces the session. Holding a
-            # stale reference was crashing the resume after an approval pause.
-            device = await self._await_device(task)
-            if device is None:
-                task.set_state(TaskState.FAILED, "device disconnected and did not return")
-                break
-
-            # ---- observe ---- (survive a transient disconnect: wait and retry the step)
-            try:
-                screen = await self._observe(device)
-            except (asyncio.TimeoutError, RuntimeError, OSError) as e:
-                disconnects += 1
-                if disconnects > 6:
-                    task.set_state(TaskState.FAILED, f"device kept disconnecting: {e}")
-                    break
-                task.log("note", f"disconnect {disconnects}; waiting to resume ({e})")
-                self.store.publish(task.id, "note", f"reconnecting ({disconnects})")
-                await asyncio.sleep(2.0)
-                continue
-            disconnects = 0
-            task.step_id = step
-            self.store.publish(task.id, "observation", screen.activity,
-                               app=screen.app_package, n_elements=len(screen.elements))
-
-            # Blind screen: no accessibility tree AND no screenshot. Usually a secure
-            # (FLAG_SECURE) screen — payment/checkout — that the app hides from capture.
-            # Don't tap blindly; give it a moment to load, then hand over to the user.
-            if not screen.elements and not screen.screenshot_b64:
-                blind += 1
-                if blind >= 3:
-                    task.summary = ("A protected screen (likely payment/checkout) is blocking "
-                                    "the agent from seeing it. Please take over on the phone.")
-                    task.log("note", "blind screen (secure) — handing to user")
-                    try:
-                        await device.push("ask_user", task_id=task.id,
-                                          questions=["This screen looks protected and I can't see it — "
-                                                     "please take over on your phone."])
-                    except Exception:
-                        pass
-                    task.set_state(TaskState.WAITING_FOR_USER,
-                                   "screen is protected (secure) — please take over")
-                    break
-                await asyncio.sleep(1.0)
-                continue
-            blind = 0
-
-            # ---- loop guard: same action repeated with no progress ----
-            if len(task.history) >= 4 and len(set(task.history[-4:])) == 1:
-                task.summary = self._summarize(task, success=False)
-                task.log("note", f"loop detected on '{task.history[-1]}' — stopping")
-                try:
-                    await device.push("ask_user", task_id=task.id,
-                                      questions=["I repeated the same step a few times without "
-                                                 "progress — the task may already be done. Please check."])
-                except Exception:
-                    pass
-                task.set_state(TaskState.WAITING_FOR_USER,
-                               f"repeated '{task.history[-1]}' without progress — please check")
-                break
-
-            # ---- verify success first (a confirmation may already be on screen) ----
-            if is_success(screen, skill, task):
-                task.summary = self._summarize(task, success=True)
-                task.set_state(TaskState.COMPLETED, "success marker verified")
-                audit(task.id, "verified", task.summary)
-                break
-
-            # ---- decide ----
-            task.set_state(TaskState.RUNNING)
-            action = await self._decide(task, skill, screen)
-            task.log("action", f"{action.type.value}", thought=action.thought)
-
-            if action.type == ActionType.DONE:
-                # Model claims done but no marker — be honest about uncertainty.
-                verified = is_success(screen, skill, task)
-                task.summary = self._summarize(task, success=verified)
-                task.set_state(TaskState.COMPLETED if verified else TaskState.WAITING_FOR_USER,
-                               "model reported done" + ("" if verified else " (unverified — please confirm)"))
-                break
-            if action.type == ActionType.FAIL:
-                task.error = action.text or action.thought
-                task.set_state(TaskState.FAILED, task.error or "agent could not proceed")
-                break
-            if action.type == ActionType.ASK_USER:
-                facts = await self._ask_user(task, [action.text or "I need more information."])
-                if task.cancel_requested:
-                    task.set_state(TaskState.CANCELLED, "cancelled")
-                    break
-                task.facts.update(facts or {})
-                continue
-
-            # ---- avoid redundant app launches; resolve name->package; let it settle ----
-            if action.type == ActionType.OPEN_APP:
-                skill = registry.get(task.skill)
-                if screen.app_package and screen.app_package in skill.app_packages:
-                    self.store.publish(task.id, "note", f"already in {screen.app_package}, skip open")
-                    task.history.append(f"(already in {screen.app_package}; skipped open_app)")
-                    continue
-                # Pass the app name/package through; the device resolves a friendly
-                # name ("Swiggy") to a package dynamically via the launcher's labels.
-                await self._act(device, action, task)
-                await asyncio.sleep(4.0)   # cold starts need time before the next observe
-                continue
-
-            # ---- policy gate (deterministic) ----
-            decision = self.policy.evaluate(action, screen)
-            audit(task.id, "policy", decision.reason, risk=decision.risk_level,
-                  action=action.type.value, allow=decision.allow)
-
-            if decision.needs_approval:
-                # Pre-authorized by the user ("do it" / "send it"): proceed on an external
-                # commitment (Level 3) without pausing. Level 4 (payment/OTP/biometric)
-                # ALWAYS pauses — it can never be pre-authorized.
-                if task.pre_authorized and decision.risk_level <= 3:
-                    task.log("note", f"pre-authorized — proceeding with {action.type.value} "
-                                     f"(level {decision.risk_level})")
-                    self.store.publish(task.id, "note", "pre-authorized; not pausing")
-                    await self._act(device, action, task)
-                    continue
-                approved = await self._approval_pause(task, device, decision, action, screen)
-                if task.cancel_requested or not approved:
-                    task.set_state(TaskState.CANCELLED, "user declined the sensitive step")
-                    break
-                task.approvals_granted += 1
-                task.set_state(TaskState.RUNNING)
-                # The wait may have been long; the device could have reconnected meanwhile.
-                device = await self._await_device(task)
-                if device is None:
-                    task.set_state(TaskState.FAILED, "device disconnected during approval")
-                    break
-                if decision.risk_level >= 4:
-                    # User-only action (payment/auth). The user performs it; we re-observe.
-                    await device.request("handoff", approval=self._approval_payload(task, decision, action, screen))
-                    continue
-                # Level 3 approved: the agent may now perform the original action.
-                await self._act(device, action, task)
-                continue
-
-            # ---- execute (auto-allowed) ----
-            await self._act(device, decision.action, task)
-            task.set_state(TaskState.VERIFYING)
-
-        else:
-            task.set_state(TaskState.FAILED, f"gave up after {MAX_STEPS} steps")
-
+        initial_state = {
+            "task": task, "skill": skill, "screen": None, "action": None,
+            "feedback": "", "react_attempts": 0, "blind": 0, "disconnects": 0,
+            "step": 0, "last_sig": "", "pending_validate": False, "status": "run",
+        }
+        # recursion_limit counts node executions (~4 per ReAct cycle); the in-node
+        # step cap (GRAPH_MAX_STEPS) is the real limiter — keep headroom above it.
+        await self.graph.ainvoke(initial_state,
+                                 config={"recursion_limit": GRAPH_MAX_STEPS * 6 + 20})
         self._emit(task)
 
     # ----------------------------------------------------------------- #
@@ -282,7 +156,8 @@ class AgentController:
         payload = await device.request("observe")
         return ScreenObservation(**(payload.get("screen", payload)))
 
-    async def _decide(self, task: Task, skill, screen: ScreenObservation) -> AgentAction:
+    async def _decide(self, task: Task, skill, screen: ScreenObservation,
+                      feedback: str = "") -> AgentAction:
         plan_summary = "; ".join(task.plan) + f"  | BOUNDARY: {task.approval_boundary}"
         # When the accessibility tree is sparse/empty but we have a screenshot, OCR the
         # image so the agent can READ names/prices (and tap them) via tap_xy.
@@ -297,7 +172,7 @@ class AgentController:
         elif len(screen.elements) <= 6:
             task.log("note", f"no screenshot (vision/OCR unavailable), els={len(screen.elements)}")
         user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen,
-                                 ocr_items=ocr)
+                                 ocr_items=ocr, feedback=feedback)
         last_err: Exception | None = None
         # Populated screens: fast gpt-oss text call from the tree (+ grouping). Sparse
         # screens: send the screenshot to Groq's vision model (qwen) to locate controls,

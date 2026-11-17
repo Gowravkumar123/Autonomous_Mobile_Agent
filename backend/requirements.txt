@@ -7,6 +7,10 @@ python-dotenv
 websockets
 python-multipart
 
+# Agent orchestration: the ReAct brain is a compiled LangGraph StateGraph
+# (app/agent/graph.py). Pulls langchain-core + langsmith.
+langgraph
+
 # OCR fallback (reads text off screenshots when the accessibility tree is empty).
 # Pulls onnxruntime + opencv + Pillow + numpy. Optional: the app degrades gracefully
 # if it isn't installed, but install it on the server to enable OCR reading.

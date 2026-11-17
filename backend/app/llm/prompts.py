@@ -74,8 +74,17 @@ def build_plan_user(goal: str, facts: dict, playbook: str) -> str:
 # Action selection (the per-step decision loop)
 # --------------------------------------------------------------------------- #
 ACTION_SYSTEM = (
-    "You are the decision core of an autonomous Android agent. You see the CURRENT SCREEN "
-    "(accessibility elements) and must choose EXACTLY ONE next action to progress the goal.\n"
+    "You are the decision core of an autonomous Android agent, running a ReAct loop: "
+    "Thought -> Action -> Observation, repeated. Each turn you see the CURRENT SCREEN, "
+    "REASON about it (put your reasoning in `thought`), then call EXACTLY ONE TOOL (one "
+    "action) to progress the goal. Next turn you will see the result and can self-correct.\n"
+    "TOOLS (choose one `type`): tap (tap element `ref`) · tap_xy (tap a point x,y when no "
+    "ref fits) · type (type `text` into a field `ref`) · enter (submit the current field / "
+    "press Go/Search) · scroll (direction) · swipe · back · home · open_app (`text`=app name) "
+    "· wait · ask_user (`text`=question, only if a required detail is truly missing) · approve "
+    "(hand a sensitive/payment step to the user) · done (goal verified complete) · fail.\n"
+    "If a REFLECTION note is present, your PREVIOUS tool had no effect — do NOT repeat it; "
+    "pick a different element, a tap_xy on the control you can see, or another route.\n"
     "Sources of screen info: the ELEMENTS list (accessibility tree); a SCREENSHOT image when "
     "attached (look at it to locate controls); and, on sparse screens, VISIBLE TEXT (OCR) with "
     "x,y positions. Use whatever is available: act on an element's `ref`, or use `tap_xy` at a "
@@ -130,7 +139,8 @@ ACTION_SYSTEM = (
 def build_action_user(goal: str, facts: dict, plan_summary: str,
                       history: list[str], screen: ScreenObservation,
                       max_elements: int = 70, max_text: int = 70,
-                      ocr_items: list[dict] | None = None) -> str:
+                      ocr_items: list[dict] | None = None,
+                      feedback: str = "") -> str:
     def clip(s: str) -> str:
         s = s or ""
         return s[:max_text] + "…" if len(s) > max_text else s
@@ -149,11 +159,13 @@ def build_action_user(goal: str, facts: dict, plan_summary: str,
     more = "" if len(screen.elements) <= max_elements else \
         f"\n(+{len(screen.elements) - max_elements} more elements not shown — scroll if needed)"
     hist = "\n".join(f"  {h}" for h in history[-8:]) or "  (none yet)"
+    reflection = f"{feedback}\n" if feedback else ""
     return (
         "MODE: action\n"
         f"GOAL: {goal}\n"
         f"KNOWN FACTS: {json.dumps(facts)}\n"
         f"PLAN: {plan_summary}\n"
+        f"{reflection}"
         f"RECENT ACTIONS:\n{hist}\n"
         f"CURRENT APP: {KNOWN_APPS.get(screen.app_package, screen.app_package)} "
         f"[{screen.app_package}]  SCREEN: {screen.activity}\n"
