@@ -16,8 +16,8 @@ android {
 
         // Points at the on-prem backend. The phone must be on a network that can
         // route to this IP. (Emulator-to-host would be 10.0.2.2 instead.)
-        buildConfigField("String", "BACKEND_WS_URL", "\"ws://10.20.0.13:8005\"")
-        buildConfigField("String", "BACKEND_HTTP_URL", "\"http://10.20.0.13:8005\"")
+        buildConfigField("String", "BACKEND_WS_URL", "\"ws://37.27.53.14:8033\"")
+        buildConfigField("String", "BACKEND_HTTP_URL", "\"http://37.27.53.14:8033\"")
     }
 
     buildFeatures {
