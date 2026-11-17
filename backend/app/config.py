@@ -15,9 +15,9 @@ class Settings(BaseSettings):
     # Uses the same GROQ_API_KEY. Override if Groq retires this model.
     groq_vision_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     gemini_api_key: str = ""
-    # 2.5 Flash: strong UI grounding + vision, free-tier friendly. 2.5 Pro is better but
-    # has much tighter free limits (can rate-limit mid-task). Override via GEMINI_MODEL.
-    gemini_model: str = "gemini-2.5-flash"
+    # Current free-tier Flash model (older gemini-2.0/2.5-flash are retired). The Gemini
+    # API's own 404 message names the latest; update here if it rotates again.
+    gemini_model: str = "gemini-3.8-flash"
 
     # Server
     host: str = "0.0.0.0"

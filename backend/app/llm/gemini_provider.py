@@ -21,9 +21,10 @@ class GeminiProvider(LLMProvider):
         gen_config: dict = {"temperature": temperature, "maxOutputTokens": max_tokens}
         if json_mode:
             gen_config["responseMimeType"] = "application/json"
-        # Disable 2.5's default "thinking" for our fast structured action calls — it
-        # otherwise consumes the output budget and can return an empty body.
-        if "2.5" in self.model:
+        # Disable the model's default "thinking" for our fast structured action calls — it
+        # otherwise consumes the output budget and can return an empty body. (2.0 Flash had
+        # no thinking; 2.5+ / 3.x Flash do.)
+        if "flash" in self.model and "2.0" not in self.model:
             gen_config["thinkingConfig"] = {"thinkingBudget": 0}
         parts: list = [{"text": user}]
         if image_b64:
