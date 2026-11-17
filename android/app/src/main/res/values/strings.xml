@@ -1,9 +1,9 @@
 <resources>
-    <string name="app_name">Personal AI Agent</string>
-    <string name="service_label">Personal AI Agent Controller</string>
+    <string name="app_name">OnePiece</string>
+    <string name="service_label">OnePiece Controller</string>
     <string name="service_description">
-        Lets your paired AI agent observe the current screen and perform taps, typing
-        and navigation to complete tasks you ask for. It pauses and hands control back
+        Lets your OnePiece AI assistant (Zoro) observe the current screen and perform taps,
+        typing and navigation to complete tasks you ask for. It pauses and hands control back
         to you before any payment, OTP or other sensitive action. You can turn this off
         at any time in Accessibility settings.
     </string>
