@@ -163,7 +163,7 @@ class AgentController:
     # ----------------------------------------------------------------- #
     # Steps
     # ----------------------------------------------------------------- #
-    async def _await_device(self, task: Task, timeout: float = 12.0) -> DeviceSession | None:
+    async def _await_device(self, task: Task, timeout: float = 30.0) -> DeviceSession | None:
         """Return a connected device, waiting briefly if it is mid-reconnect."""
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout

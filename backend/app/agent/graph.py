@@ -356,54 +356,64 @@ def build_react_graph(controller):
             task.set_state(TaskState.FAILED, "device disconnected")
             return {"status": "failed"}
 
-        # ---- avoid redundant launches; resolve name->package on the device ----
-        if action.type == ActionType.OPEN_APP:
-            cur = registry.get(task.skill)
-            if screen.app_package and screen.app_package in cur.app_packages:
-                c.store.publish(task.id, "note", f"already in {screen.app_package}, skip open")
-                task.history.append(f"(already in {screen.app_package}; skipped open_app)")
-                return {"status": "run", "pending_validate": False}
-            await c._act(device, action, task)
-            await asyncio.sleep(4.0)   # cold starts need time before the next observe
-            return {"status": "run", "last_sig": _screen_sig(screen), "pending_validate": True}
-
-        # ---- deterministic policy gate ----
-        decision = c.policy.evaluate(action, screen)
-        audit(task.id, "policy", decision.reason, risk=decision.risk_level,
-              action=action.type.value, allow=decision.allow)
-
-        if decision.needs_approval:
-            # Pre-authorized ("do it"/"send it"): proceed on an external commitment
-            # (Level 3) without pausing. Level 4 (payment/OTP/biometric) ALWAYS pauses.
-            if task.pre_authorized and decision.risk_level <= 3:
-                task.log("note", f"pre-authorized — proceeding with {action.type.value} "
-                                 f"(level {decision.risk_level})")
-                c.store.publish(task.id, "note", "pre-authorized; not pausing")
+        # Everything below touches the device. On this flaky mobile->cloud link the socket
+        # can drop mid-action; treat that as a soft retry (re-observe once it reconnects)
+        # instead of crashing the whole task.
+        try:
+            # ---- avoid redundant launches; resolve name->package on the device ----
+            if action.type == ActionType.OPEN_APP:
+                cur = registry.get(task.skill)
+                if screen.app_package and screen.app_package in cur.app_packages:
+                    c.store.publish(task.id, "note", f"already in {screen.app_package}, skip open")
+                    task.history.append(f"(already in {screen.app_package}; skipped open_app)")
+                    return {"status": "run", "pending_validate": False}
                 await c._act(device, action, task)
+                await asyncio.sleep(4.0)   # cold starts need time before the next observe
                 return {"status": "run", "last_sig": _screen_sig(screen), "pending_validate": True}
 
-            approved = await c._approval_pause(task, device, decision, action, screen)
-            if task.cancel_requested or not approved:
-                task.set_state(TaskState.CANCELLED, "user declined the sensitive step")
-                return {"status": "cancelled"}
-            task.approvals_granted += 1
-            task.set_state(TaskState.RUNNING)
-            device = await c._await_device(task)   # may have reconnected during the wait
-            if device is None:
-                task.set_state(TaskState.FAILED, "device disconnected during approval")
-                return {"status": "failed"}
-            if decision.risk_level >= 4:
-                # User-only action (payment/auth): the user performs it; we re-observe.
-                await device.request("handoff",
-                                     approval=c._approval_payload(task, decision, action, screen))
-                return {"status": "run", "pending_validate": False}
-            await c._act(device, action, task)  # Level 3 approved
+            # ---- deterministic policy gate ----
+            decision = c.policy.evaluate(action, screen)
+            audit(task.id, "policy", decision.reason, risk=decision.risk_level,
+                  action=action.type.value, allow=decision.allow)
+
+            if decision.needs_approval:
+                # Pre-authorized ("do it"/"send it"): proceed on an external commitment
+                # (Level 3) without pausing. Level 4 (payment/OTP/biometric) ALWAYS pauses.
+                if task.pre_authorized and decision.risk_level <= 3:
+                    task.log("note", f"pre-authorized — proceeding with {action.type.value} "
+                                     f"(level {decision.risk_level})")
+                    c.store.publish(task.id, "note", "pre-authorized; not pausing")
+                    await c._act(device, action, task)
+                    return {"status": "run", "last_sig": _screen_sig(screen), "pending_validate": True}
+
+                approved = await c._approval_pause(task, device, decision, action, screen)
+                if task.cancel_requested or not approved:
+                    task.set_state(TaskState.CANCELLED, "user declined the sensitive step")
+                    return {"status": "cancelled"}
+                task.approvals_granted += 1
+                task.set_state(TaskState.RUNNING)
+                device = await c._await_device(task)   # may have reconnected during the wait
+                if device is None:
+                    task.set_state(TaskState.FAILED, "device disconnected during approval")
+                    return {"status": "failed"}
+                if decision.risk_level >= 4:
+                    # User-only action (payment/auth): the user performs it; we re-observe.
+                    await device.request("handoff",
+                                         approval=c._approval_payload(task, decision, action, screen))
+                    return {"status": "run", "pending_validate": False}
+                await c._act(device, action, task)  # Level 3 approved
+                return {"status": "run", "last_sig": _screen_sig(screen), "pending_validate": True}
+
+            # ---- auto-allowed (read-only / reversible preparation) ----
+            await c._act(device, decision.action, task)
+            task.set_state(TaskState.VERIFYING)
             return {"status": "run", "last_sig": _screen_sig(screen), "pending_validate": True}
 
-        # ---- auto-allowed (read-only / reversible preparation) ----
-        await c._act(device, decision.action, task)
-        task.set_state(TaskState.VERIFYING)
-        return {"status": "run", "last_sig": _screen_sig(screen), "pending_validate": True}
+        except (RuntimeError, OSError, asyncio.TimeoutError) as e:
+            task.log("note", f"action interrupted by a disconnect — will re-observe ({e})")
+            c.store.publish(task.id, "note", "action interrupted; reconnecting")
+            await asyncio.sleep(2.0)
+            return {"status": "run", "pending_validate": False, "feedback": ""}
 
     # ------------------------------------------------------------------ #
     # Wiring: observe -> validate -> reason -> act -> observe (while "run")
