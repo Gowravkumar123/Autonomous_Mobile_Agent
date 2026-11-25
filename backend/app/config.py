@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     # USE_GEMINI=true to add it as a fallback after Groq.
     use_gemini: bool = False
 
+    # Persistence — Postgres (e.g. Neon). Empty = in-memory only (tasks lost on restart).
+    database_url: str = ""
+
     # Server
     host: str = "0.0.0.0"
     port: int = 8000

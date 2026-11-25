@@ -337,3 +337,4 @@ class AgentController:
     def _emit(self, task: Task) -> None:
         self.store.publish(task.id, "state", task.state.value, summary=task.summary,
                            error=task.error)
+        self.store.schedule_persist(task)   # durable checkpoint in Postgres (if configured)

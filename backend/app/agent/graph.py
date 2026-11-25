@@ -152,17 +152,27 @@ def build_react_graph(controller):
 
         disconnects = state.get("disconnects", 0)
         blind = state.get("blind", 0)
+        offline_waits = 0   # consecutive 30s waits with the phone fully offline
 
         # Acquisition loop: re-fetch the device and screen, surviving a transient
-        # disconnect (OEM battery kill) and a brief protected/blank screen.
+        # disconnect (OEM battery kill), a long network dropout, and a brief
+        # protected/blank screen.
         while True:
             if task.cancel_requested:
                 task.set_state(TaskState.CANCELLED, "cancelled by user")
                 return {"status": "cancelled"}
             device = await c._await_device(task)
             if device is None:
-                task.set_state(TaskState.FAILED, "device disconnected and did not return")
-                return {"status": "failed"}
+                # The phone<->cloud link can drop for well over 30s. Keep waiting (up to
+                # ~2 minutes total) before declaring the task dead.
+                offline_waits += 1
+                if offline_waits >= 4:
+                    task.set_state(TaskState.FAILED, "device offline for ~2 minutes")
+                    return {"status": "failed"}
+                task.log("note", f"device offline — still waiting ({offline_waits}/4)")
+                c.store.publish(task.id, "note", "phone offline — waiting for it to reconnect")
+                continue
+            offline_waits = 0
             try:
                 screen = await c._observe(device)
             except (asyncio.TimeoutError, RuntimeError, OSError) as e:

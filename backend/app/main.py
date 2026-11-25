@@ -36,8 +36,24 @@ async def lifespan(app: FastAPI):
         app.state.llm, app.state.policy, app.state.devices,
         app.state.store, app.state.memory,
     )
-    log.info("Agent backend ready. Active LLM: %s", app.state.llm.active)
+    # Durable persistence (Postgres / Neon). Optional: without DATABASE_URL, or if the
+    # DB is unreachable, everything still runs in-memory.
+    app.state.db = None
+    if s.database_url.strip():
+        from .audit.logger import set_audit_db
+        from .db.postgres import Database
+        db = Database(s.database_url.strip())
+        if await db.init():
+            app.state.db = db
+            app.state.store.db = db
+            set_audit_db(db)
+            n = await app.state.store.hydrate()
+            log.info("Restored %d task(s) from Postgres", n)
+    log.info("Agent backend ready. Active LLM: %s | DB: %s", app.state.llm.active,
+             "postgres" if app.state.db else "in-memory")
     yield
+    if app.state.db:
+        await app.state.db.close()   # flush pending writes on shutdown
 
 
 app = FastAPI(title="Autonomous Personal AI Agent", version="0.1.0", lifespan=lifespan)
@@ -65,6 +81,7 @@ class Answer(BaseModel):
 async def health():
     from .vision.ocr import available as ocr_available
     return {"ok": True, "llm": app.state.llm.active, "ocr": ocr_available(),
+            "db": "postgres" if getattr(app.state, "db", None) else "in-memory",
             "devices": list(app.state.devices._sessions.keys())}
 
 

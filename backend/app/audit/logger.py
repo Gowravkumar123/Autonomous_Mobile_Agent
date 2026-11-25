@@ -25,12 +25,25 @@ def _redact(data: dict) -> dict:
     return out
 
 
+# Optional durable sink (app.db.postgres.Database), set at startup when Postgres is up.
+_db = None
+
+
+def set_audit_db(db) -> None:
+    global _db
+    _db = db
+
+
 def audit(task_id: str, kind: str, detail: str = "", **data) -> None:
     _AUDIT_DIR.mkdir(exist_ok=True)
+    clean = _redact(data)
     record = {"ts": time.time(), "task_id": task_id, "kind": kind,
-              "detail": detail, "data": _redact(data)}
+              "detail": detail, "data": clean}
     try:
         with (_AUDIT_DIR / f"{task_id}.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+            f.write(json.dumps(record, default=str) + "\n")
     except OSError as e:
         log.warning("audit write failed: %s", e)
+    # Append-only mirror in Postgres (blueprint: audit_events). Non-blocking, batched.
+    if _db is not None:
+        _db.enqueue_audit(task_id, "agent", kind, detail, clean)

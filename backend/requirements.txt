@@ -11,6 +11,9 @@ python-multipart
 # (app/agent/graph.py). Pulls langchain-core + langsmith.
 langgraph
 
+# Persistence: Postgres (Neon) via pg8000 — pure Python, no native libpq needed.
+pg8000
+
 # OCR fallback (reads text off screenshots when the accessibility tree is empty).
 # Pulls onnxruntime + opencv + Pillow + numpy. Optional: the app degrades gracefully
 # if it isn't installed, but install it on the server to enable OCR reading.
