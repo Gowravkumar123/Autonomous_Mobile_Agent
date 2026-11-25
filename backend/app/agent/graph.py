@@ -35,6 +35,7 @@ from . import _compat  # noqa: F401
 import asyncio
 import hashlib
 import logging
+import re
 from typing import Any, Optional, TypedDict
 
 try:
@@ -85,30 +86,30 @@ class AgentState(TypedDict, total=False):
 
 # Strong "advance the booking" CTAs. If one of these is visible and the model tries to
 # scroll past it, we tap it instead (the free model repeatedly scrolls past 'Book tickets').
+# No bare "book" — it false-matched "Facebook". Matched on WORD BOUNDARIES below.
 _CTA_PHRASES = (
-    "book tickets", "book now", "book ticket", "get tickets", "proceed to pay",
+    "book tickets", "book ticket", "book now", "get tickets", "proceed to pay",
     "proceed", "continue", "select seats", "select seat", "confirm booking",
-    "place order", "pay now", "pay later", "add to cart", "checkout", "book", "reserve",
+    "place order", "pay now", "pay later", "add to cart", "checkout",
 )
+_CTA_RE = re.compile(r"\b(" + "|".join(re.escape(p) for p in _CTA_PHRASES) + r")\b")
 
 
 def _find_cta(screen: ScreenObservation):
     """Return a visible, clickable element that clearly advances the flow, else None.
 
-    Longer phrases win (prefer 'book tickets' over a bare 'book'), and we only match
-    reasonably short labels so a sentence that merely contains 'book' isn't tapped.
+    Matches whole words only (so 'Facebook' never matches 'book'), ignores long
+    non-button labels, and prefers the longest matching phrase.
     """
     best = None
     best_len = 0
     for e in screen.elements:
         label = f"{e.text} {e.desc}".strip().lower()
-        if not label or len(label) > 24:
+        if not label or len(label) > 24 or not (e.clickable or e.enabled):
             continue
-        if not (e.clickable or e.enabled):
-            continue
-        for phrase in _CTA_PHRASES:
-            if phrase in label and len(phrase) > best_len:
-                best, best_len = e, len(phrase)
+        m = _CTA_RE.search(label)
+        if m and len(m.group(1)) > best_len:
+            best, best_len = e, len(m.group(1))
     return best
 
 

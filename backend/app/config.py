@@ -12,10 +12,11 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     # Capable model for the per-step action decisions (quality matters most here).
     groq_model: str = "openai/gpt-oss-120b"
-    # Cheaper, smaller model for the simpler structured calls (intent + planning), which
-    # run once per task. Big cost saving with negligible quality loss; set GROQ_FAST_MODEL
-    # equal to GROQ_MODEL to disable the split.
-    groq_fast_model: str = "openai/gpt-oss-20b"
+    # Model for the simpler structured calls (intent + planning). Defaults to the capable
+    # model: a weaker model (e.g. gpt-oss-20b) mis-classified intent and broke the whole
+    # run, and these are only ~2 calls/task so the saving is tiny. Opt into a cheaper one
+    # by setting GROQ_FAST_MODEL only if your tasks are simple.
+    groq_fast_model: str = "openai/gpt-oss-120b"
     # Groq's multimodal model, used for action decisions on sparse screens when a
     # screenshot is available (same GROQ_API_KEY, fast). Override if Groq rotates it.
     groq_vision_model: str = "qwen/qwen3.8-27b"
