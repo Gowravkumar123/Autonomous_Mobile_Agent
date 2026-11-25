@@ -50,6 +50,7 @@ except Exception as _lg_err:  # not installed / unavailable on this Python
 
 from ..audit.logger import audit
 from ..mobile.schema import ActionType, AgentAction, ScreenObservation
+from .approvals import action_binding
 from ..skills import registry
 from .state import Task, TaskState
 from .verifier import is_success
@@ -143,6 +144,8 @@ def build_react_graph(controller):
     async def observe(state: AgentState) -> dict:
         task: Task = state["task"]
         step = state.get("step", 0)
+        # Cycle boundary: honour a pause here (the previous action has completed).
+        await c.wait_if_paused(task)
         if task.cancel_requested:
             task.set_state(TaskState.CANCELLED, "cancelled by user")
             return {"status": "cancelled"}
@@ -397,9 +400,15 @@ def build_react_graph(controller):
                     await c._act(device, action, task)
                     return {"status": "run", "last_sig": _screen_sig(screen), "pending_validate": True}
 
-                approved = await c._approval_pause(task, device, decision, action, screen)
-                if task.cancel_requested or not approved:
-                    task.set_state(TaskState.CANCELLED, "user declined the sensitive step")
+                outcome, bound_hash = await c._approval_pause(task, device, decision,
+                                                              action, screen)
+                if task.cancel_requested or outcome == "cancelled":
+                    task.set_state(TaskState.CANCELLED, "cancelled during approval")
+                    return {"status": "cancelled"}
+                if outcome != "approved":
+                    task.set_state(TaskState.CANCELLED,
+                                   "approval expired — the sensitive step was not performed"
+                                   if outcome == "expired" else "user declined the sensitive step")
                     return {"status": "cancelled"}
                 task.approvals_granted += 1
                 task.set_state(TaskState.RUNNING)
@@ -412,8 +421,21 @@ def build_react_graph(controller):
                     await device.request("handoff",
                                          approval=c._approval_payload(task, decision, action, screen))
                     return {"status": "run", "pending_validate": False}
-                await c._act(device, action, task)  # Level 3 approved
-                return {"status": "run", "last_sig": _screen_sig(screen), "pending_validate": True}
+
+                # Level 3: re-validate the approval against a FRESH screen immediately before
+                # executing. If the target button / amount / app changed while the user was
+                # deciding, the approval no longer describes what we'd do -> invalidate and
+                # let the loop re-decide (which re-requests approval for the new state).
+                fresh = await c._observe(device)
+                if action_binding(action, fresh) != bound_hash:
+                    c.invalidate_approval(task, bound_hash,
+                                          "screen changed after approval (target/amount differ)")
+                    task.approvals_granted -= 1
+                    return {"status": "run", "pending_validate": False,
+                            "feedback": "The screen changed after the user approved; re-check "
+                                        "it and request approval again if still needed."}
+                await c._act(device, action, task)  # Level 3 approved and still valid
+                return {"status": "run", "last_sig": _screen_sig(fresh), "pending_validate": True}
 
             # ---- auto-allowed (read-only / reversible preparation) ----
             await c._act(device, decision.action, task)

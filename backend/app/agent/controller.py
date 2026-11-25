@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from ..audit.logger import audit
 from ..llm.base import LLMError
@@ -22,6 +23,8 @@ from ..policy.engine import PolicyEngine
 from ..skills import registry
 from ..store import TaskStore
 from ..ws import DeviceRegistry, DeviceSession
+from .approvals import (APPROVED, EXPIRED, INVALIDATED, PENDING, REJECTED, ApprovalRecord,
+                        action_binding)
 from .intent import analyze_intent, make_plan
 from .memory import MemoryManager
 from .state import TERMINAL, Task, TaskState
@@ -45,6 +48,10 @@ class AgentController:
         # Last prompt (ask_user / approval_request) pushed per waiting task, so we can
         # re-deliver it when the device reconnects after a flap. (type, data) keyed by task.
         self._pending_prompts: dict[str, tuple[str, dict]] = {}
+        # Transaction-bound approval records (approval_id -> record), and pause gates.
+        self._approval_records: dict[str, ApprovalRecord] = {}
+        self._resume: dict[str, asyncio.Event] = {}
+        self.approval_ttl_s = 900.0
         self._graph = None  # compiled lazily (imports langgraph on first run)
 
     async def on_device_connected(self, session: DeviceSession) -> None:
@@ -77,12 +84,50 @@ class AgentController:
     # ----------------------------------------------------------------- #
     # Public: resolve pauses (called by REST endpoints or inbound ws).
     # ----------------------------------------------------------------- #
-    def resolve_approval(self, task_id: str, approved: bool, note: str = "") -> bool:
-        fut = self._approvals.get(task_id)
+    def resolve_approval(self, task_id: str, approved: bool, note: str = "",
+                         approver: str = "device") -> bool:
+        """Decide the task's CURRENT pending approval (phone UI / legacy endpoint)."""
+        task = self.store.get(task_id)
+        rec = self._approval_records.get(task.pending_approval_id) if task else None
+        if rec is not None:
+            return self.decide_approval(rec.approval_id, approved, note, approver)[0]
+        fut = self._approvals.get(task_id)            # e.g. cancel() racing record creation
         if fut and not fut.done():
             fut.set_result((approved, note))
             return True
         return False
+
+    def decide_approval(self, approval_id: str, approved: bool, note: str = "",
+                        approver: str = "") -> tuple[bool, str]:
+        """Decide one exact approval by id (blueprint: POST /v1/approvals/{id}/decision)."""
+        rec = self._approval_records.get(approval_id)
+        if rec is None:
+            return False, "unknown approval"
+        if rec.decision != PENDING:
+            return False, f"already {rec.decision}"
+        if rec.expired:
+            rec.decide(EXPIRED, "system", "expired before a decision")
+            self._persist_approval(rec)
+            return False, "approval expired"
+        rec.decide(APPROVED if approved else REJECTED, approver, note)
+        self._persist_approval(rec)
+        fut = self._approvals.get(rec.task_id)
+        if fut and not fut.done():
+            fut.set_result((approved, note))
+        return True, rec.decision
+
+    def get_approval(self, approval_id: str) -> ApprovalRecord | None:
+        return self._approval_records.get(approval_id)
+
+    def approvals_for(self, task_id: str) -> list[ApprovalRecord]:
+        return [r for r in self._approval_records.values() if r.task_id == task_id]
+
+    def _persist_approval(self, rec: ApprovalRecord) -> None:
+        if self.store.db:
+            try:
+                asyncio.get_running_loop().create_task(self.store.db.upsert_approval(rec.view()))
+            except RuntimeError:
+                pass
 
     def resolve_answer(self, task_id: str, facts: dict) -> bool:
         fut = self._answers.get(task_id)
@@ -91,13 +136,51 @@ class AgentController:
             return True
         return False
 
+    def pause(self, task_id: str) -> bool:
+        """Pause at the next ReAct cycle boundary (the current action is allowed to finish)."""
+        task = self.store.get(task_id)
+        if not task or task.state in TERMINAL:
+            return False
+        task.pause_requested = True
+        self._resume.setdefault(task_id, asyncio.Event()).clear()
+        self.store.publish(task_id, "note", "pause requested")
+        return True
+
+    def resume(self, task_id: str) -> bool:
+        task = self.store.get(task_id)
+        if not task or task.state in TERMINAL:
+            return False
+        task.pause_requested = False
+        self._resume.setdefault(task_id, asyncio.Event()).set()
+        return True
+
+    async def wait_if_paused(self, task: Task) -> None:
+        """Called by the graph at each cycle boundary; blocks while the task is paused."""
+        if not task.pause_requested:
+            return
+        prev = task.state
+        task.set_state(TaskState.PAUSED, "paused by user")
+        self._emit(task)
+        ev = self._resume.setdefault(task.id, asyncio.Event())
+        while task.pause_requested and not task.cancel_requested:
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+        if not task.cancel_requested:
+            task.set_state(TaskState.RUNNING if prev == TaskState.PAUSED else prev,
+                           "resumed")
+            self._emit(task)
+
     def cancel(self, task_id: str) -> None:
         task = self.store.get(task_id)
         if task:
             task.cancel_requested = True
             # Unblock any pending pauses so the loop can observe the cancel.
-            self.resolve_approval(task_id, False, "cancelled")
+            self.resolve_approval(task_id, False, "cancelled", approver="system")
             self.resolve_answer(task_id, {})
+            if task_id in self._resume:
+                self._resume[task_id].set()
 
     # ----------------------------------------------------------------- #
     # Main driver
@@ -243,12 +326,32 @@ class AgentController:
         audit(task.id, "action", label, type=action.type.value, ref=action.ref)
 
     async def _approval_pause(self, task: Task, device: DeviceSession, decision,
-                              action: AgentAction, screen: ScreenObservation) -> bool:
+                              action: AgentAction, screen: ScreenObservation) -> tuple[str, str]:
+        """Create a transaction-bound approval and wait for its decision.
+
+        Returns (decision, action_hash) where decision is approved | rejected | expired |
+        cancelled. The hash binds the approval to this exact action + target + amount; the
+        caller re-checks it against a fresh screen before executing.
+        """
         payload = self._approval_payload(task, decision, action, screen)
+        rec = ApprovalRecord(
+            task_id=task.id, step_id=task.step_id, action_hash=action_binding(action, screen),
+            expires_at=time.time() + self.approval_ttl_s, title=payload.get("title", ""),
+            reason=decision.reason, amount=payload.get("amount"),
+            action_label=self._action_label(action), risk_level=decision.risk_level)
+        self._approval_records[rec.approval_id] = rec
+        payload.update(approval_id=rec.approval_id, expires_in=int(self.approval_ttl_s))
         task.pending_action = action
         task.pending_approval_reason = decision.reason
+        task.pending_approval_id = rec.approval_id
+        # Future + record exist BEFORE we push, so even an instant answer can't race them.
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._approvals[task.id] = fut
+        self._persist_approval(rec)
+
         task.log("approval_requested", decision.reason, risk=decision.risk_level, **payload)
         task.set_state(TaskState.WAITING_FOR_USER, decision.reason)
+        self._emit(task)
         self._pending_prompts[task.id] = ("approval_request", payload)
         try:
             await device.push("approval_request", **payload)
@@ -257,16 +360,31 @@ class AgentController:
         self.store.publish(task.id, "approval", decision.reason, approval=payload)
         audit(task.id, "approval_requested", decision.reason, approval=payload)
 
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._approvals[task.id] = fut
         try:
-            approved, note = await fut
+            approved, note = await asyncio.wait_for(fut, timeout=self.approval_ttl_s)
+            outcome = rec.decision if rec.decision != PENDING else (APPROVED if approved else REJECTED)
+            if task.cancel_requested:
+                outcome = "cancelled"
+        except asyncio.TimeoutError:
+            rec.decide(EXPIRED, "system", "no decision before expiry")
+            self._persist_approval(rec)
+            outcome, note = EXPIRED, "expired"
         finally:
             self._approvals.pop(task.id, None)
             self._pending_prompts.pop(task.id, None)
-        audit(task.id, "approval_decided", f"approved={approved}", note=note)
-        self.store.publish(task.id, "approval_decided", f"approved={approved}")
-        return approved
+            task.pending_approval_id = ""
+        audit(task.id, "approval_decided", outcome, note=note, approval_id=rec.approval_id)
+        self.store.publish(task.id, "approval_decided", outcome, approval_id=rec.approval_id)
+        return outcome, rec.action_hash
+
+    def invalidate_approval(self, task: Task, action_hash: str, why: str) -> None:
+        for rec in self.approvals_for(task.id):
+            if rec.action_hash == action_hash and rec.decision == APPROVED:
+                rec.decide(INVALIDATED, "system", why)
+                self._persist_approval(rec)
+        audit(task.id, "approval_invalidated", why)
+        task.log("note", f"approval invalidated: {why}")
+        self.store.publish(task.id, "note", f"approval invalidated — {why}")
 
     @staticmethod
     def _with_choices(question: str, options: list[str]) -> str:

@@ -16,6 +16,7 @@ class TaskState(str, Enum):
     PLANNING = "PLANNING"
     RUNNING = "RUNNING"
     WAITING_FOR_USER = "WAITING_FOR_USER"
+    PAUSED = "PAUSED"            # user paused; resumes at the next ReAct cycle boundary
     VERIFYING = "VERIFYING"
     RECOVERING = "RECOVERING"
     COMPLETED = "COMPLETED"
@@ -62,6 +63,9 @@ class Task(BaseModel):
     summary: str = ""
     error: str = ""
     cancel_requested: bool = False
+    pause_requested: bool = False
+    # The approval currently awaiting a decision (transaction-bound; see controller).
+    pending_approval_id: str = ""
 
     events: list[TaskEvent] = Field(default_factory=list)
     created_at: float = Field(default_factory=time.time)

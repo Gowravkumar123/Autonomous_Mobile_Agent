@@ -62,6 +62,22 @@ SCHEMA = [
     """,
     "CREATE INDEX IF NOT EXISTS audit_task_idx ON audit_events (task_id)",
     """
+    CREATE TABLE IF NOT EXISTS approvals (
+        approval_id  text PRIMARY KEY,
+        task_id      text NOT NULL,
+        step_id      integer,
+        action_hash  text NOT NULL,
+        risk_level   integer,
+        created_at   timestamptz NOT NULL,
+        expires_at   timestamptz NOT NULL,
+        decision     text NOT NULL,
+        approver     text,
+        decided_at   timestamptz,
+        data         jsonb
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS approvals_task_idx ON approvals (task_id)",
+    """
     CREATE TABLE IF NOT EXISTS devices (
         device_id   text PRIMARY KEY,
         jti         text NOT NULL,
@@ -255,6 +271,26 @@ class Database:
             conn.cursor().execute(sql, params)
             conn.commit()
         await self._call(work)
+
+    # ---- approvals (rare + security-relevant: written immediately) ----
+    async def upsert_approval(self, rec: dict) -> None:
+        if not self.ok:
+            return
+        try:
+            await self.execute(
+                "INSERT INTO approvals (approval_id, task_id, step_id, action_hash, "
+                "risk_level, created_at, expires_at, decision, approver, decided_at, data) "
+                "VALUES (%s,%s,%s,%s,%s,to_timestamp(%s::float8),to_timestamp(%s::float8),"
+                "%s,%s,to_timestamp(%s::float8),%s::jsonb) "
+                "ON CONFLICT (approval_id) DO UPDATE SET decision = EXCLUDED.decision, "
+                "approver = EXCLUDED.approver, decided_at = EXCLUDED.decided_at, "
+                "data = EXCLUDED.data",
+                (rec["approval_id"], rec["task_id"], rec.get("step_id"), rec["action_hash"],
+                 rec.get("risk_level"), rec["created_at"], rec["expires_at"], rec["decision"],
+                 rec.get("approver") or None, rec.get("decided_at"),
+                 json.dumps(rec, default=str)))
+        except Exception as e:
+            log.warning("persist approval %s failed: %s", rec.get("approval_id"), e)
 
     # ---- devices (pairing is rare, so write immediately rather than batching) ----
     async def upsert_device(self, device_id: str, jti: str, revoked: bool = False) -> None:

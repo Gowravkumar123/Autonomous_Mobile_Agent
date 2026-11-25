@@ -190,6 +190,7 @@ async def skills(_: Principal = Depends(principal)):
              "approval_boundary": s.approval_boundary} for s in registry.all_skills()]
 
 
+@app.post("/v1/tasks")
 @app.post("/tasks")
 async def create_task(body: CreateTask, p: Principal = Depends(principal)):
     # A device can only start tasks on itself; an admin may target any device.
@@ -200,11 +201,13 @@ async def create_task(body: CreateTask, p: Principal = Depends(principal)):
     return {"task_id": task.id, "state": task.state.value}
 
 
+@app.get("/v1/tasks")
 @app.get("/tasks")
 async def list_tasks(p: Principal = Depends(principal)):
     return [_task_view(t) for t in app.state.store.all() if _visible(p, t)]
 
 
+@app.get("/v1/tasks/{task_id}")
 @app.get("/tasks/{task_id}")
 async def get_task(task_id: str, p: Principal = Depends(principal)):
     return _task_view(_own_task(p, task_id), full=True)
@@ -212,16 +215,61 @@ async def get_task(task_id: str, p: Principal = Depends(principal)):
 
 @app.post("/tasks/{task_id}/approve")
 async def approve(task_id: str, body: Approve, p: Principal = Depends(principal)):
+    """Legacy: decide the task's current pending approval."""
     _own_task(p, task_id)
-    return {"ok": app.state.controller.resolve_approval(task_id, body.approved, body.note)}
+    return {"ok": app.state.controller.resolve_approval(task_id, body.approved, body.note,
+                                                        approver=p.sub)}
 
 
+@app.post("/v1/tasks/{task_id}/pause")
+async def pause_task(task_id: str, p: Principal = Depends(principal)):
+    _own_task(p, task_id)
+    return {"ok": app.state.controller.pause(task_id)}
+
+
+@app.post("/v1/tasks/{task_id}/resume")
+async def resume_task(task_id: str, p: Principal = Depends(principal)):
+    _own_task(p, task_id)
+    return {"ok": app.state.controller.resume(task_id)}
+
+
+@app.get("/v1/tasks/{task_id}/approvals")
+async def task_approvals(task_id: str, p: Principal = Depends(principal)):
+    _own_task(p, task_id)
+    return [r.view() for r in app.state.controller.approvals_for(task_id)]
+
+
+@app.get("/v1/approvals/{approval_id}")
+async def get_approval(approval_id: str, p: Principal = Depends(principal)):
+    rec = app.state.controller.get_approval(approval_id)
+    if rec is None:
+        raise HTTPException(404, "approval not found")
+    _own_task(p, rec.task_id)
+    return rec.view()
+
+
+@app.post("/v1/approvals/{approval_id}/decision")
+async def decide_approval(approval_id: str, body: Approve, p: Principal = Depends(principal)):
+    """Approve or reject one EXACT pending action (blueprint: transaction-bound approval)."""
+    rec = app.state.controller.get_approval(approval_id)
+    if rec is None:
+        raise HTTPException(404, "approval not found")
+    _own_task(p, rec.task_id)
+    ok, result = app.state.controller.decide_approval(approval_id, body.approved, body.note,
+                                                      approver=p.sub)
+    if not ok:
+        raise HTTPException(409, result)
+    return {"approval_id": approval_id, "decision": result}
+
+
+@app.post("/v1/tasks/{task_id}/answer")
 @app.post("/tasks/{task_id}/answer")
 async def answer(task_id: str, body: Answer, p: Principal = Depends(principal)):
     _own_task(p, task_id)
     return {"ok": app.state.controller.resolve_answer(task_id, body.facts)}
 
 
+@app.post("/v1/tasks/{task_id}/cancel")
 @app.post("/tasks/{task_id}/cancel")
 async def cancel(task_id: str, p: Principal = Depends(principal)):
     _own_task(p, task_id)
@@ -286,7 +334,7 @@ async def ws_device(socket: WebSocket, device_id: str):
                     continue                  # can't answer someone else's task
                 if mtype == "approval_response":
                     controller.resolve_approval(task.id, bool(msg.get("approved")),
-                                                msg.get("note", ""))
+                                                msg.get("note", ""), approver=p.sub)
                 else:
                     controller.resolve_answer(task.id, msg.get("facts", {}))
             else:
@@ -300,15 +348,32 @@ async def ws_device(socket: WebSocket, device_id: str):
 
 @app.websocket("/ws/events")
 async def ws_events(socket: WebSocket):
+    await _stream_events(socket, task_id=None)
+
+
+@app.websocket("/v1/tasks/{task_id}/events")
+async def ws_task_events(socket: WebSocket, task_id: str):
+    """Blueprint: stream plan updates, tool activity, status and approvals for ONE task."""
+    await _stream_events(socket, task_id=task_id)
+
+
+async def _stream_events(socket: WebSocket, task_id: str | None) -> None:
     p = ws_principal(socket)
     if p is None:
         await socket.close(code=1008)
         return
+    if task_id is not None:
+        task = app.state.store.get(task_id)
+        if task is None or not _visible(p, task):
+            await socket.close(code=1008)
+            return
     await socket.accept()
     q = app.state.store.subscribe()
     try:
         while True:
             event = await q.get()
+            if task_id is not None and event.get("task_id") != task_id:
+                continue
             if not p.is_admin:
                 task = app.state.store.get(event.get("task_id", ""))
                 if task is None or not _visible(p, task):
