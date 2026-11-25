@@ -82,7 +82,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
 # helpers
 # --------------------------------------------------------------------------- #
 def _visible(p: Principal, task: Task) -> bool:
-    return p.is_admin or (p.scope == "device" and task.device_id == p.sub)
+    # Visibility follows the OWNER (a phone still owns a task it started even when that
+    # task runs in the server-side browser). Older tasks fall back to device_id.
+    owner = task.owner or task.device_id
+    return p.is_admin or (p.scope == "device" and owner == p.sub)
 
 
 def _own_task(p: Principal, task_id: str) -> Task:
@@ -95,7 +98,8 @@ def _own_task(p: Principal, task_id: str) -> Task:
 def _task_view(task: Task, full: bool = False) -> dict:
     view = {
         "task_id": task.id, "state": task.state.value, "prompt": task.prompt,
-        "device_id": task.device_id,
+        "device_id": task.device_id, "owner": task.owner, "executor": task.executor,
+        "evidence": task.evidence,
         "goal": task.goal, "skill": task.skill, "app_hint": task.app_hint,
         "facts": task.facts, "plan": task.plan, "approval_boundary": task.approval_boundary,
         "summary": task.summary, "error": task.error, "step_id": task.step_id,
@@ -173,6 +177,8 @@ async def revoke_device(device_id: str, _: Principal = Depends(admin)):
 class CreateTask(BaseModel):
     prompt: str
     device_id: str = ""
+    executor: str = "auto"      # auto | mobile | browser
+    start_url: str = ""         # optional first page for the browser executor
 
 
 class Approve(BaseModel):
@@ -195,7 +201,13 @@ async def skills(_: Principal = Depends(principal)):
 async def create_task(body: CreateTask, p: Principal = Depends(principal)):
     # A device can only start tasks on itself; an admin may target any device.
     device_id = p.sub if p.scope == "device" else body.device_id
-    task = Task(prompt=body.prompt, device_id=device_id)
+    executor = body.executor.strip().lower()
+    if executor not in ("auto", "mobile", "browser", ""):
+        raise HTTPException(422, "executor must be auto, mobile or browser")
+    if body.start_url and not body.start_url.startswith(("http://", "https://")):
+        raise HTTPException(422, "start_url must be an http(s) URL")
+    task = Task(prompt=body.prompt, device_id=device_id, owner=p.sub,
+                executor="" if executor == "auto" else executor, start_url=body.start_url)
     app.state.store.create(task)
     asyncio.create_task(app.state.controller.run_task(task))
     return {"task_id": task.id, "state": task.state.value}
@@ -231,6 +243,20 @@ async def pause_task(task_id: str, p: Principal = Depends(principal)):
 async def resume_task(task_id: str, p: Principal = Depends(principal)):
     _own_task(p, task_id)
     return {"ok": app.state.controller.resume(task_id)}
+
+
+@app.get("/v1/tasks/{task_id}/evidence/{name}")
+async def task_evidence(task_id: str, name: str, p: Principal = Depends(principal)):
+    """Final-state screenshot captured by the browser executor (blueprint: evidence)."""
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+    task = _own_task(p, task_id)
+    if name not in task.evidence:                    # only files recorded for THIS task
+        raise HTTPException(404, "evidence not found")
+    path = Path(__file__).resolve().parents[1] / "evidence" / Path(name).name
+    if not path.is_file():
+        raise HTTPException(404, "evidence file missing")
+    return FileResponse(path, media_type="image/png")
 
 
 @app.get("/v1/tasks/{task_id}/approvals")

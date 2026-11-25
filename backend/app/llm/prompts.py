@@ -155,11 +155,18 @@ ACTION_SYSTEM = (
 )
 
 
+BROWSER_HINT = (
+    "EXECUTOR: web browser (Chromium). The screen is a WEB PAGE; ELEMENTS are DOM nodes "
+    "(links, buttons, inputs). Use `open_app` with a URL or domain to navigate (e.g. "
+    "`bookmyshow.com`), or with plain words to run a web search. Type into inputs by ref, "
+    "then `enter` to submit. `back` = browser back.\n")
+
+
 def build_action_user(goal: str, facts: dict, plan_summary: str,
                       history: list[str], screen: ScreenObservation,
                       max_elements: int = 70, max_text: int = 70,
                       ocr_items: list[dict] | None = None,
-                      feedback: str = "") -> str:
+                      feedback: str = "", executor: str = "") -> str:
     def clip(s: str) -> str:
         s = s or ""
         return s[:max_text] + "…" if len(s) > max_text else s
@@ -181,7 +188,8 @@ def build_action_user(goal: str, facts: dict, plan_summary: str,
     reflection = f"{feedback}\n" if feedback else ""
     return (
         "MODE: action\n"
-        f"GOAL: {goal}\n"
+        + (BROWSER_HINT if executor == "browser" else "")
+        + f"GOAL: {goal}\n"
         f"KNOWN FACTS: {json.dumps(facts)}\n"
         f"PLAN: {plan_summary}\n"
         f"{reflection}"

@@ -23,3 +23,8 @@ numpy
 
 # Auth: signed admin/device tokens (HS256 JWT)
 pyjwt
+
+# Browser executor (headless Chromium). After installing, ALSO run once on the server:
+#   python -m playwright install --with-deps chromium
+# Optional: without it the agent still runs on the phone; browser tasks fail cleanly.
+playwright

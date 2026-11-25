@@ -24,6 +24,19 @@ def test_proceed_to_pay_button_blocked():
     assert d.needs_approval and d.risk_level == 4
 
 
+def test_seat_pick_allowed_while_pay_button_visible():
+    """A page that SHOWS 'Proceed to pay' must not escalate picking a seat; tapping the
+    pay button itself still must."""
+    pe = PolicyEngine(spend_threshold=0)
+    screen = _screen(
+        UiElement(ref=0, role="CheckBox", text="Seat A1", clickable=True),
+        UiElement(ref=1, role="Button", text="Proceed to pay ₹500", clickable=True))
+    seat = pe.evaluate(AgentAction(type=ActionType.TAP, ref=0), screen)
+    assert seat.allow and not seat.needs_approval
+    pay = pe.evaluate(AgentAction(type=ActionType.TAP, ref=1), screen)
+    assert pay.needs_approval and pay.risk_level == 4
+
+
 def test_never_type_otp():
     pe = PolicyEngine(spend_threshold=0)
     screen = _screen(UiElement(ref=0, role="EditText", desc="OTP", editable=True))

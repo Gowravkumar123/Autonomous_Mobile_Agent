@@ -26,9 +26,15 @@ class Settings(BaseSettings):
     # quality loss. Vision (an image = many input tokens) is gated to only fire when it
     # actually helps: a sparse tree, or when the text path is stuck on a not-too-rich
     # screen (on dense trees the text path is both better AND cheaper).
-    action_max_tokens: int = 700
-    intent_max_tokens: int = 500
-    plan_max_tokens: int = 600
+    # NOTE gpt-oss is a reasoning model: hidden reasoning counts toward these caps. Too
+    # tight and the answer comes back EMPTY (seen live: intent at 500). The provider
+    # retries once with a bigger cap on an empty "length" stop, but keep sane floors.
+    action_max_tokens: int = 900
+    intent_max_tokens: int = 900
+    plan_max_tokens: int = 900
+    # Intent + planning are simple structured calls: "low" reasoning is cheaper and
+    # leaves more of the cap for the answer. Action decisions keep the model default.
+    fast_reasoning_effort: str = "low"
     vision_sparse_max: int = 8      # use vision when a screen has <= this many elements
     vision_stuck_max: int = 28      # ...or when stuck, but only up to this element count
     max_elements_in_prompt: int = 55
@@ -51,6 +57,16 @@ class Settings(BaseSettings):
     # `python -m app.auth.cli new-secret`.
     auth_secret: str = ""
     auth_token_days: int = 365
+
+    # Browser executor (Playwright). Needs `pip install playwright` and
+    # `playwright install --with-deps chromium` on the server; absent = mobile only.
+    browser_enabled: bool = True
+    browser_headless: bool = True
+    # Comma-separated allowlist of domains the browser may navigate to (subdomains
+    # included). Empty = any domain.
+    browser_allowed_domains: str = ""
+    browser_search_url: str = "https://duckduckgo.com/html/?q={q}"
+    browser_max_sessions: int = 2      # concurrent browser tasks (resource limit)
 
     # Server
     host: str = "0.0.0.0"

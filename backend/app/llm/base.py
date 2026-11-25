@@ -52,4 +52,44 @@ def extract_json(text: str) -> dict:
                         return json.loads(text[start:i + 1])
                     except json.JSONDecodeError:
                         break
+    tagged = _from_tags(text)
+    if tagged:
+        return tagged
     raise LLMError(f"Could not parse JSON from model output: {text[:300]!r}")
+
+
+# Some models (seen: Groq's qwen vision model) ignore JSON mode and answer in XML-ish tags:
+#   <thought>…</thought><action>tap</action><ref>4</ref><expectation>…</expectation>
+# Recover the same fields instead of wasting the call. The policy engine still gates the
+# resulting action exactly as it would a JSON one.
+_TAG_FIELDS = ("type", "action", "ref", "text", "x", "y", "direction", "seconds",
+               "thought", "expectation")
+
+
+def _from_tags(text: str) -> dict | None:
+    found: dict[str, Any] = {}
+    for f in _TAG_FIELDS:
+        m = re.search(rf"<{f}>\s*(.*?)\s*</{f}>", text, re.DOTALL | re.IGNORECASE)
+        if m:
+            found[f] = m.group(1).strip()
+    if "type" not in found and "action" in found:
+        found["type"] = found.pop("action")
+    if "type" not in found:
+        return None
+    found["type"] = found["type"].strip().lower()
+    for f in ("ref",):
+        if f in found:
+            try:
+                found[f] = int(found[f])
+            except ValueError:
+                found[f] = None
+    for f in ("x", "y", "seconds"):
+        if f in found:
+            try:
+                found[f] = float(found[f])
+            except ValueError:
+                found.pop(f)
+    for f in ("text", "direction"):
+        if found.get(f, "").lower() in ("", "null", "none"):
+            found.pop(f, None)
+    return found

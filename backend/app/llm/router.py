@@ -28,7 +28,8 @@ class LLMRouter(LLMProvider):
             self.chain.append(GroqProvider(settings.groq_api_key, settings.groq_model,
                                            settings.groq_vision_model))
             self.fast_chain.append(GroqProvider(settings.groq_api_key, settings.groq_fast_model,
-                                                settings.groq_vision_model))
+                                                settings.groq_vision_model,
+                                                reasoning_effort=settings.fast_reasoning_effort))
         if settings.has_gemini and settings.use_gemini:
             gem = GeminiProvider(settings.gemini_api_key, settings.gemini_model)
             self.chain.append(gem)

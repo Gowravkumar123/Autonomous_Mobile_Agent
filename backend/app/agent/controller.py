@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 
 from ..audit.logger import audit
@@ -65,7 +66,8 @@ class AgentController:
             task = self.store.get(task_id)
             if not task or task.state is not TaskState.WAITING_FOR_USER:
                 continue
-            if task.device_id and task.device_id != session.device_id:
+            # Deliver to the executing device, or to the owner's phone (browser tasks).
+            if task.device_id and session.device_id not in (task.device_id, task.owner):
                 continue
             try:
                 await session.push(ptype, **data)
@@ -186,8 +188,12 @@ class AgentController:
     # Main driver
     # ----------------------------------------------------------------- #
     async def run_task(self, task: Task) -> None:
+        browser = None
         try:
             await self._plan_phase(task)
+            if task.state in TERMINAL:
+                return
+            browser = await self._select_executor(task)
             if task.state in TERMINAL:
                 return
             await self._execute_phase(task)
@@ -200,6 +206,99 @@ class AgentController:
         finally:
             self._approvals.pop(task.id, None)
             self._answers.pop(task.id, None)
+            if browser is not None:
+                await self._close_browser(task, browser)
+
+    # ----------------------------------------------------------------- #
+    # select_executor (blueprint): mobile (paired phone) or browser (Playwright)
+    # ----------------------------------------------------------------- #
+    # A URL or a bare domain (not an e-mail address), or an explicit "on the website".
+    _WEB_RE = re.compile(
+        r"https?://|(?<![@\w.])(?:www\.)?[a-z0-9-]+\.(?:com|in|org|net|io|co|gov|edu|app|dev)"
+        r"(?:/|\b)(?!@)|\b(?:website|web ?site|on the web|in the browser|in a browser)\b",
+        re.IGNORECASE)
+
+    def _phone_connected(self) -> bool:
+        return any(getattr(d, "kind", "") != "browser" for d in self.devices._sessions.values())
+
+    def _choose_executor(self, task: Task) -> str:
+        if task.executor in ("mobile", "browser"):
+            return task.executor
+        if task.start_url or self._WEB_RE.search(task.prompt):
+            return "browser"
+        if task.device_id and not task.device_id.startswith("browser-"):
+            return "mobile"
+        return "mobile" if self._phone_connected() else "browser"
+
+    async def _select_executor(self, task: Task):
+        """Pick the runtime and, for the browser, start an isolated session for this task."""
+        from ..config import get_settings
+        s = get_settings()
+        task.executor = self._choose_executor(task)
+        if task.executor != "browser":
+            audit(task.id, "executor", "mobile", device=task.device_id)
+            task.log("note", f"executor: mobile ({task.device_id or 'any phone'})")
+            return None
+
+        if not s.browser_enabled:
+            task.set_state(TaskState.FAILED, "browser executor is disabled (BROWSER_ENABLED)")
+            return None
+        active = sum(1 for d in self.devices._sessions.values()
+                     if getattr(d, "kind", "") == "browser")
+        if active >= s.browser_max_sessions:
+            task.set_state(TaskState.FAILED, "too many concurrent browser tasks — try again soon")
+            return None
+        try:
+            from ..executors.browser import BrowserSession
+        except ImportError:
+            task.set_state(TaskState.FAILED, "browser executor unavailable (pip install playwright)")
+            return None
+
+        allowed = tuple(d for d in s.browser_allowed_domains.split(",") if d.strip())
+        session = BrowserSession(
+            f"browser-{task.id}", allowed_domains=allowed, search_url=s.browser_search_url,
+            headless=s.browser_headless,
+            notify=lambda t, d: self._notify_owner(task, t, d))
+        try:
+            await session.start(task.start_url or "about:blank")
+        except Exception as e:
+            await session.close()
+            task.set_state(TaskState.FAILED, f"could not start the browser: {e} "
+                                             "(run `playwright install --with-deps chromium`)")
+            return None
+        task.device_id = session.device_id
+        self.devices.add(session)                         # same registry as phones
+        audit(task.id, "executor", "browser", start_url=task.start_url,
+              allowed_domains=list(allowed))
+        task.log("note", "executor: browser (isolated Chromium context)")
+        self._emit(task)
+        return session
+
+    async def _notify_owner(self, task: Task, type_: str, data: dict) -> None:
+        """Browser tasks have no screen of their own: surface their questions/approvals on
+        the owner's phone if it's connected (else the user answers via the API)."""
+        if task.owner and task.owner != "admin":
+            phone = self.devices.get(task.owner)
+            if phone is not None and getattr(phone, "kind", "") != "browser":
+                await phone.push(type_, **data)
+
+    async def _close_browser(self, task: Task, session) -> None:
+        try:
+            png = await session.evidence()
+            if png:
+                from pathlib import Path
+                folder = Path(__file__).resolve().parents[2] / "evidence"
+                folder.mkdir(exist_ok=True)
+                path = folder / f"{task.id}.png"
+                path.write_bytes(png)
+                task.evidence.append(path.name)
+                task.log("evidence", "final screenshot saved", file=path.name)
+                self._emit(task)
+        except Exception as e:
+            log.warning("evidence capture failed: %s", e)
+        finally:
+            self.devices.remove(session.device_id, session)
+            await session.close()
 
     async def _plan_phase(self, task: Task) -> None:
         task.set_state(TaskState.PLANNING)
@@ -252,9 +351,10 @@ class AgentController:
         deadline = loop.time() + timeout
         while True:
             # A task bound to a device runs ONLY on that device (never fall back to some
-            # other connected phone); unbound tasks may use any device.
+            # other connected phone); unbound tasks may use any connected PHONE.
             dev = (self.devices.get(task.device_id) if task.device_id
-                   else self.devices.any())
+                   else next((d for d in self.devices._sessions.values()
+                              if getattr(d, "kind", "") != "browser"), None))
             if dev is not None:
                 return dev
             if task.cancel_requested or loop.time() >= deadline:
@@ -284,7 +384,7 @@ class AgentController:
         s = get_settings()
         user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen,
                                  max_elements=s.max_elements_in_prompt, ocr_items=ocr,
-                                 feedback=feedback)
+                                 feedback=feedback, executor=task.executor)
         last_err: Exception | None = None
         # Populated screens: fast gpt-oss text call from the tree (+ grouping). Vision
         # (qwen + a base64 image = many input tokens) is COST-GATED: only fire it on a

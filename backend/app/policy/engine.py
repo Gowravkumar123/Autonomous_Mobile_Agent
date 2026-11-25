@@ -21,12 +21,14 @@ from ..mobile.schema import ActionType, AgentAction, ScreenObservation
 # Phrases on a SCREEN that signal a payment / authentication context. Deliberately
 # multi-word: bare words like "upi"/"otp" match payment-app icons and notifications on
 # the home screen and caused false pauses. The action-button check below still catches
-# "Pay"/"Place order" buttons, so these only need to cover secret-entry screens.
+# "Pay"/"Proceed to pay"/"Place order" buttons, so these only need to cover secret-entry
+# and payment-selection screens. ("proceed to pay"/"make payment" used to be here too,
+# which escalated EVERY action — even picking a seat — on any page merely showing that
+# button; tapping the button itself is still Level 4 via FINANCIAL_ACTION.)
 FINANCIAL_SCREEN = [
     "enter upi pin", "upi pin", "card number", "enter cvv", "cvv", "net banking",
     "netbanking", "wallet pin", "one time password", "enter otp", "verify otp",
-    "enter pin", "enter mpin", "proceed to pay", "make payment", "payment method",
-    "add money", "enter your pin",
+    "enter pin", "enter mpin", "payment method", "add money", "enter your pin",
 ]
 # Words on a BUTTON the agent is about to tap that commit money.
 FINANCIAL_ACTION = [

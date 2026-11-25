@@ -1,0 +1,16 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CineTest — Seats</title></head>
+<body>
+  <h2>Select seats</h2>
+  <input type="checkbox" id="A1" aria-label="Seat A1" onchange="upd()">
+  <input type="checkbox" id="A2" aria-label="Seat A2" onchange="upd()">
+  <input type="checkbox" id="A3" aria-label="Seat A3" onchange="upd()">
+  <p id="total">Total ₹0</p>
+  <a href="pay.html"><button type="button">Proceed to pay</button></a>
+  <script>
+    function upd() {
+      const n = document.querySelectorAll('input:checked').length;
+      document.getElementById('total').textContent = 'Total ₹' + (n * 250);
+    }
+  </script>
+</body></html>

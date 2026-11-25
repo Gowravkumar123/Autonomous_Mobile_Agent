@@ -36,7 +36,11 @@ class TaskEvent(BaseModel):
 
 class Task(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
-    device_id: str = ""
+    device_id: str = ""            # execution target (a phone, or "browser-<task id>")
+    owner: str = ""                # who may see/control it: "admin" or a paired device id
+    executor: str = ""             # "mobile" | "browser" ("" = auto-select after planning)
+    start_url: str = ""            # optional starting page for the browser executor
+    evidence: list[str] = Field(default_factory=list)   # e.g. final screenshot paths
     prompt: str = ""
     state: TaskState = TaskState.CREATED
 

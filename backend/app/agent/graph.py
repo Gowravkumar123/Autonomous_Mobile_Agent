@@ -129,7 +129,9 @@ def _screen_sig(screen: ScreenObservation) -> str:
     """A stable fingerprint of what is on screen, for change detection."""
     if not screen.elements:
         return f"empty|{screen.app_package}|{screen.activity}|shot={bool(screen.screenshot_b64)}"
-    items = sorted((e.role, e.text, e.resource_id, e.editable) for e in screen.elements)
+    # `checked` is included so toggling a checkbox/seat counts as a visible change.
+    items = sorted((e.role, e.text, e.resource_id, e.editable, str(e.checked))
+                   for e in screen.elements)
     blob = repr((screen.app_package, screen.activity, items)).encode()
     return hashlib.blake2b(blob, digest_size=12).hexdigest()
 
@@ -310,8 +312,8 @@ def build_react_graph(controller):
         # reason about a near-blank screen. This is the #1 cause of the agent "asking
         # instead of acting" at the start. Capped so a non-launching app can't loop.
         opens = state.get("opens", 0)
-        if (skill.app_packages and screen.app_package not in skill.app_packages
-                and opens < 2):
+        if (task.executor != "browser" and skill.app_packages
+                and screen.app_package not in skill.app_packages and opens < 2):
             name = _target_app_name(skill)
             task.log("action", "open_app", thought=f"Not in the target app; opening {name}.")
             return {"action": AgentAction(type=ActionType.OPEN_APP, text=name,
@@ -418,8 +420,14 @@ def build_react_graph(controller):
                     return {"status": "failed"}
                 if decision.risk_level >= 4:
                     # User-only action (payment/auth): the user performs it; we re-observe.
-                    await device.request("handoff",
-                                         approval=c._approval_payload(task, decision, action, screen))
+                    resp = await device.request(
+                        "handoff", approval=c._approval_payload(task, decision, action, screen))
+                    if isinstance(resp, dict) and resp.get("stop"):
+                        # Executor can't let the user act in place (headless browser):
+                        # stop here and tell them where to finish.
+                        task.summary = resp.get("message") or "Please finish this step yourself."
+                        task.set_state(TaskState.WAITING_FOR_USER, task.summary)
+                        return {"status": "waiting"}
                     return {"status": "run", "pending_validate": False}
 
                 # Level 3: re-validate the approval against a FRESH screen immediately before

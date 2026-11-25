@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CineTest — Results</title></head>
+<body>
+  <h2 id="heading">Results</h2>
+  <a href="https://facebook.com/cinetest">Facebook</a>
+  <div id="list"></div>
+  <script>
+    const q = new URLSearchParams(location.search).get('q') || '';
+    document.getElementById('heading').textContent = 'Results for ' + q;
+    const movies = ['Scene', 'Other Movie'].filter(m => m.toLowerCase().includes(q.toLowerCase()) || !q);
+    document.getElementById('list').innerHTML = movies.map(m =>
+      `<div class="card"><h3>${m}</h3><p>Telugu · 2h 10m</p>` +
+      `<a href="show.html?m=${encodeURIComponent(m)}">Book tickets</a></div>`).join('');
+  </script>
+</body></html>

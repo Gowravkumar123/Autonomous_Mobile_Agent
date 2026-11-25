@@ -15,10 +15,15 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 class GroqProvider(LLMProvider):
     name = "groq"
 
-    def __init__(self, api_key: str, model: str, vision_model: str = ""):
+    def __init__(self, api_key: str, model: str, vision_model: str = "",
+                 reasoning_effort: str = ""):
         self.api_key = api_key
         self.model = model
         self.vision_model = vision_model or model
+        # gpt-oss models are reasoning models: their hidden reasoning tokens count against
+        # max_tokens. "low" effort = fewer hidden tokens = cheaper, and far less risk of the
+        # budget being spent before any visible answer. Only sent to gpt-oss models.
+        self.reasoning_effort = reasoning_effort
 
     def _payload(self, system: str, user: str, temperature: float, max_tokens: int,
                  json_mode: bool, image_b64: str | None) -> dict:
@@ -43,6 +48,8 @@ class GroqProvider(LLMProvider):
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        if self.reasoning_effort and "gpt-oss" in model:
+            payload["reasoning_effort"] = self.reasoning_effort
         return payload
 
     async def complete(self, system: str, user: str, *, temperature: float = 0.2,
@@ -62,7 +69,18 @@ class GroqProvider(LLMProvider):
                         json=self._payload(system, user, temperature, max_tokens, False, image_b64))
                 r.raise_for_status()
                 data = r.json()
-            return data["choices"][0]["message"]["content"]
+                choice = data["choices"][0]
+                content = (choice.get("message") or {}).get("content") or ""
+                # Reasoning ate the whole budget before any answer: retry ONCE with more
+                # room (pay for extra tokens only when actually needed).
+                if not content.strip() and choice.get("finish_reason") == "length":
+                    bigger = min(max_tokens * 2, 4096)
+                    r = await client.post(
+                        GROQ_URL, headers=headers,
+                        json=self._payload(system, user, temperature, bigger, json_mode, image_b64))
+                    r.raise_for_status()
+                    content = (r.json()["choices"][0].get("message") or {}).get("content") or ""
+            return content
         except httpx.HTTPStatusError as e:
             raise LLMError(f"Groq HTTP {e.response.status_code}: {e.response.text[:200]}") from e
         except (httpx.HTTPError, KeyError, IndexError) as e:

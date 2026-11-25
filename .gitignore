@@ -4,6 +4,8 @@ __pycache__/
 *.pyc
 backend/.env
 backend/audit_logs/
+# Browser-executor screenshots of real task pages (may contain personal data)
+backend/evidence/
 
 # Android / Gradle
 android/.gradle/
