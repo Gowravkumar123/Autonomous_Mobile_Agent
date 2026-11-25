@@ -22,6 +22,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.quantumleap.agent.BuildConfig
+import com.quantumleap.agent.net.Auth
+import com.quantumleap.agent.net.Auth.withAuth
 import com.quantumleap.agent.service.AgentAccessibilityService
 import com.quantumleap.agent.service.AgentForegroundService
 import okhttp3.Call
@@ -46,6 +48,7 @@ class MainActivity : AppCompatActivity() {
     private val ui = Handler(Looper.getMainLooper())
     private lateinit var status: TextView
     private lateinit var panel: LinearLayout
+    private lateinit var pairStatus: TextView
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -69,6 +72,37 @@ class MainActivity : AppCompatActivity() {
             text = "1 · Enable the controller (Accessibility)"
             setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
         })
+
+        // --- pairing: the backend only accepts paired phones ---
+        pairStatus = TextView(this).apply { setPadding(0, 16, 0, 4) }
+        root.addView(pairStatus)
+        val pairRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val codeField = EditText(this).apply {
+            hint = "6-digit pairing code"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            tag = "pair_code"
+        }
+        pairRow.addView(codeField, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        pairRow.addView(Button(this).apply {
+            text = "Pair"
+            tag = "pair_button"
+            setOnClickListener {
+                val code = codeField.text.toString().trim()
+                if (code.length != 6) { toast("Enter the 6-digit code"); return@setOnClickListener }
+                Auth.pair(this@MainActivity, code) { ok, msg ->
+                    ui.post {
+                        toast(msg)
+                        if (ok) {
+                            codeField.setText("")
+                            AgentAccessibilityService.instance?.reconnect()
+                        }
+                        refreshPairStatus()
+                    }
+                }
+            }
+        })
+        root.addView(pairRow)
+        refreshPairStatus()
 
         val prompt = EditText(this).apply {
             hint = "Speak or type a task, e.g. 'order a chicken biryani, cheapest, stop before payment'"
@@ -154,23 +188,38 @@ class MainActivity : AppCompatActivity() {
     }
 
     // --------------------------------------------------------------- //
+    private fun refreshPairStatus() {
+        val svc = AgentAccessibilityService.instance
+        pairStatus.text = when {
+            !Auth.isPaired(this) -> "Pairing: NOT paired (${Auth.deviceId}) — enter a code from the backend"
+            svc?.authRejected == true -> "Pairing: backend rejected this phone — pair again"
+            else -> "Pairing: paired as ${Auth.deviceId} ✓"
+        }
+    }
+
     private fun createTask(prompt: String) {
         val body = JSONObject().put("prompt", prompt).toString()
             .toRequestBody("application/json".toMediaType())
-        val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/tasks").post(body).build()
+        val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/tasks").post(body)
+            .withAuth(this).build()
         http.newCall(req).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 ui.post { toast("Could not reach backend: ${e.message}") }
             }
             override fun onResponse(call: Call, response: Response) {
-                response.close(); ui.post { speak("Starting."); toast("Task started") }
+                val code = response.code
+                response.close()
+                ui.post {
+                    if (code == 401) toast("Not paired — enter a pairing code first")
+                    else { speak("Starting."); toast("Task started") }
+                }
             }
         })
     }
 
     private fun stopAll() {
         val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/stop")
-            .post("".toRequestBody("application/json".toMediaType())).build()
+            .post("".toRequestBody("application/json".toMediaType())).withAuth(this).build()
         http.newCall(req).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) { ui.post { toast("Couldn't reach server") } }
             override fun onResponse(call: Call, response: Response) {
@@ -184,6 +233,7 @@ class MainActivity : AppCompatActivity() {
             override fun run() {
                 val svc = AgentAccessibilityService.instance
                 status.text = "Status: " + (svc?.lastStatus ?: "controller not enabled")
+                refreshPairStatus()
                 render(svc)   // voice Q&A is handled by AgentForegroundService in the background
                 ui.postDelayed(this, 1000)
             }

@@ -61,6 +61,14 @@ SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS audit_task_idx ON audit_events (task_id)",
+    """
+    CREATE TABLE IF NOT EXISTS devices (
+        device_id   text PRIMARY KEY,
+        jti         text NOT NULL,
+        paired_at   timestamptz NOT NULL DEFAULT now(),
+        revoked     boolean NOT NULL DEFAULT false
+    )
+    """,
 ]
 
 # Multi-row statements: on a high-latency link (dev box -> Neon us-east-1 ~1s/statement)
@@ -247,6 +255,23 @@ class Database:
             conn.cursor().execute(sql, params)
             conn.commit()
         await self._call(work)
+
+    # ---- devices (pairing is rare, so write immediately rather than batching) ----
+    async def upsert_device(self, device_id: str, jti: str, revoked: bool = False) -> None:
+        await self.execute(
+            "INSERT INTO devices (device_id, jti, revoked) VALUES (%s, %s, %s) "
+            "ON CONFLICT (device_id) DO UPDATE SET jti = EXCLUDED.jti, "
+            "revoked = EXCLUDED.revoked, paired_at = now()",
+            (device_id, jti, revoked))
+
+    async def set_device_revoked(self, device_id: str, revoked: bool = True) -> None:
+        await self.execute("UPDATE devices SET revoked = %s WHERE device_id = %s",
+                           (revoked, device_id))
+
+    async def load_devices(self) -> list[tuple]:
+        if not self.ok:
+            return []
+        return await self.query("SELECT device_id, jti, revoked, paired_at FROM devices")
 
     async def load_tasks(self, limit: int = 200) -> list[dict]:
         if not self.ok:

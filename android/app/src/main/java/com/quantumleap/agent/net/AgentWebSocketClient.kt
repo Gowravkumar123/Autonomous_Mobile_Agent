@@ -18,6 +18,8 @@ class AgentWebSocketClient(
     private val wsUrl: String,
     private val deviceId: String,
     private val handler: Handler,
+    /** Returns the device bearer token (null until the phone is paired). */
+    private val tokenProvider: () -> String? = { null },
 ) {
     interface Handler {
         /** Reply with the current screen JSON (wrapped as {"screen": {...}}). */
@@ -46,10 +48,25 @@ class AgentWebSocketClient(
 
     @Volatile private var socket: WebSocket? = null
     @Volatile private var closed = false
+    /** True while the backend rejects us (not paired / revoked): retry slowly, not every 2s. */
+    @Volatile var authRejected = false
+        private set
 
     fun connect() {
         closed = false
         open()
+    }
+
+    // Each open() gets a new generation; callbacks from older sockets are ignored, so a
+    // cancelled/replaced socket can never schedule a duplicate reconnect.
+    @Volatile private var generation = 0
+
+    /** Drop the current socket and reconnect now (e.g. right after pairing). */
+    fun reconnectNow() {
+        authRejected = false
+        val old = socket
+        if (!closed) open()
+        old?.cancel()
     }
 
     fun disconnect() {
@@ -77,10 +94,16 @@ class AgentWebSocketClient(
             .put("facts", JSONObject().put("clarification_answer", answerText)))
     }
 
+    @Synchronized
     private fun open() {
-        val request = Request.Builder().url("$wsUrl/ws/device/$deviceId").build()
-        socket = client.newWebSocket(request, object : WebSocketListener() {
+        val gen = ++generation
+        val builder = Request.Builder().url("$wsUrl/ws/device/$deviceId")
+        val token = tokenProvider()
+        if (!token.isNullOrBlank()) builder.header("Authorization", "Bearer $token")
+        socket = client.newWebSocket(builder.build(), object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
+                if (gen != generation) return
+                authRejected = false
                 Log.i(TAG, "connected as $deviceId")
             }
 
@@ -89,12 +112,32 @@ class AgentWebSocketClient(
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                Log.w(TAG, "ws failure: ${t.message}")
-                scheduleReconnect()
+                if (gen != generation) return
+                val code = response?.code
+                if (code == 401 || code == 403) {
+                    // Not paired, or the token was revoked: no point hammering every 2s.
+                    authRejected = true
+                    Log.w(TAG, "backend rejected this device ($code) — pair it in the app")
+                    scheduleReconnect(gen, 30_000)
+                } else {
+                    Log.w(TAG, "ws failure: ${t.message}")
+                    scheduleReconnect(gen, 2_000)
+                }
+            }
+
+            override fun onClosing(ws: WebSocket, code: Int, reason: String) {
+                ws.close(1000, null)
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                if (!closed) scheduleReconnect()
+                if (gen != generation || closed) return
+                if (code == 1008) {                       // policy violation: revoked
+                    authRejected = true
+                    Log.w(TAG, "backend closed the socket (revoked?) — pair again")
+                    scheduleReconnect(gen, 30_000)
+                } else {
+                    scheduleReconnect(gen, 2_000)
+                }
             }
         })
     }
@@ -122,11 +165,12 @@ class AgentWebSocketClient(
         ws.send(JSONObject().put("rid", rid).put("payload", payload).toString())
     }
 
-    private fun scheduleReconnect() {
+    private fun scheduleReconnect(gen: Int, delayMs: Long) {
         if (closed) return
         Thread {
-            Thread.sleep(2000)
-            if (!closed) open()
+            try { Thread.sleep(delayMs) } catch (_: InterruptedException) {}
+            // Only reconnect if nothing newer (e.g. reconnectNow) has replaced this socket.
+            if (!closed && gen == generation) open()
         }.start()
     }
 

@@ -48,7 +48,7 @@ async def main():
     # fact makes it ask a clarification that the fake device never answers (hangs).
     task = Task(prompt=("Book two train tickets from Hyderabad to Bengaluru for tomorrow. "
                         "Prefer AC 3-tier. Compare trains, enter passenger details, stop "
-                        "before payment."), device_id="persist-test")
+                        "before payment."), device_id="sim")   # must match FakeDevice
     fake.task_id = task.id
     store.create(task)
     await asyncio.wait_for(controller.run_task(task), timeout=60)

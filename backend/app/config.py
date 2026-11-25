@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     # Persistence — Postgres (e.g. Neon). Empty = in-memory only (tasks lost on restart).
     database_url: str = ""
 
+    # Authentication. HMAC key for the signed admin/device tokens. EMPTY = auth DISABLED
+    # (every endpoint open — only acceptable on a private network). Generate one with
+    # `python -m app.auth.cli new-secret`.
+    auth_secret: str = ""
+    auth_token_days: int = 365
+
     # Server
     host: str = "0.0.0.0"
     port: int = 8000

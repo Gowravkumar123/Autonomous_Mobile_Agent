@@ -10,6 +10,7 @@ import android.view.accessibility.AccessibilityEvent
 import com.quantumleap.agent.BuildConfig
 import com.quantumleap.agent.model.AgentAction
 import com.quantumleap.agent.net.AgentWebSocketClient
+import com.quantumleap.agent.net.Auth
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CountDownLatch
@@ -43,12 +44,24 @@ class AgentAccessibilityService : AccessibilityService(), AgentWebSocketClient.H
         super.onServiceConnected()
         instance = this
         executor = ActionExecutor(this)
-        val deviceId = "android-${android.os.Build.MODEL}".replace(" ", "-")
-        ws = AgentWebSocketClient(BuildConfig.BACKEND_WS_URL, deviceId, this).also { it.connect() }
+        val deviceId = Auth.deviceId
+        ws = AgentWebSocketClient(BuildConfig.BACKEND_WS_URL, deviceId, this,
+                                  tokenProvider = { Auth.token(this) }).also { it.connect() }
         AgentForegroundService.keepAlive(this)   // keep the process alive + enable background voice
-        lastStatus = "Connected. Waiting for a task."
-        Log.i(TAG, "service connected, device=$deviceId")
+        lastStatus = if (Auth.isPaired(this)) "Connected. Waiting for a task."
+                     else "Not paired — enter a pairing code in the app."
+        Log.i(TAG, "service connected, device=$deviceId paired=${Auth.isPaired(this)}")
     }
+
+    /** Reconnect the agent socket now (called right after pairing). */
+    fun reconnect() {
+        ws?.reconnectNow()
+        lastStatus = "Paired. Connecting…"
+    }
+
+    /** True when the backend is refusing this device (unpaired / revoked). */
+    val authRejected: Boolean
+        get() = ws?.authRejected == true
 
     override fun onDestroy() {
         ws?.disconnect()

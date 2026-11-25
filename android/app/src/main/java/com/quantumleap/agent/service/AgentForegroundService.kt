@@ -23,6 +23,7 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import com.quantumleap.agent.BuildConfig
+import com.quantumleap.agent.net.Auth.withAuth
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
@@ -172,18 +173,23 @@ class AgentForegroundService : Service() {
     private fun createTask(prompt: String) {
         val body = JSONObject().put("prompt", prompt).toString()
             .toRequestBody("application/json".toMediaType())
-        val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/tasks").post(body).build()
+        val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/tasks").post(body)
+            .withAuth(this).build()
         http.newCall(req).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 Log.w(TAG, "task post failed: ${e.message}"); main.post { speak("I couldn't reach the server.") }
             }
-            override fun onResponse(call: Call, response: Response) { response.close() }
+            override fun onResponse(call: Call, response: Response) {
+                val code = response.code
+                response.close()
+                if (code == 401) main.post { speak("This phone isn't paired yet. Open the app and enter a pairing code.") }
+            }
         })
     }
 
     private fun stopTasks() {
         val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/stop")
-            .post("".toRequestBody("application/json".toMediaType())).build()
+            .post("".toRequestBody("application/json".toMediaType())).withAuth(this).build()
         http.newCall(req).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {}
             override fun onResponse(call: Call, response: Response) { response.close(); main.post { speak("Stopped.") } }
@@ -196,7 +202,8 @@ class AgentForegroundService : Service() {
     private fun speakThen(text: String, after: () -> Unit) {
         val body = JSONObject().put("text", text).toString()
             .toRequestBody("application/json".toMediaType())
-        val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/voice/tts").post(body).build()
+        val req = Request.Builder().url("${BuildConfig.BACKEND_HTTP_URL}/voice/tts").post(body)
+            .withAuth(this).build()
         http.newCall(req).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) { main.post { androidSpeakThen(text, after) } }
             override fun onResponse(call: Call, response: Response) {

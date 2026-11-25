@@ -20,3 +20,6 @@ pg8000
 rapidocr-onnxruntime
 pillow
 numpy
+
+# Auth: signed admin/device tokens (HS256 JWT)
+pyjwt

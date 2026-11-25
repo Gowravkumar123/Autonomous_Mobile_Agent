@@ -70,7 +70,18 @@ class DeviceRegistry:
         self._sessions[session.device_id] = session
         log.info("device connected: %s", session.device_id)
 
-    def remove(self, device_id: str) -> None:
+    def remove(self, device_id: str, session: DeviceSession | None = None) -> None:
+        """Drop a device's session — but only if it is still the CURRENT one.
+
+        After a flap the phone reconnects and its new session replaces the old one; the
+        server notices the old socket died a little later. Removing by id alone would
+        then delete the NEW, healthy session, leaving the phone connected but invisible
+        to the backend (tasks failed with "device disconnected and did not return").
+        """
+        current = self._sessions.get(device_id)
+        if session is not None and current is not session:
+            log.info("stale session for %s closed (newer one kept)", device_id)
+            return
         self._sessions.pop(device_id, None)
         log.info("device disconnected: %s", device_id)
 

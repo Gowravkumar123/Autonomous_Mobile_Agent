@@ -168,7 +168,10 @@ class AgentController:
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         while True:
-            dev = self.devices.get(task.device_id) or self.devices.any()
+            # A task bound to a device runs ONLY on that device (never fall back to some
+            # other connected phone); unbound tasks may use any device.
+            dev = (self.devices.get(task.device_id) if task.device_id
+                   else self.devices.any())
             if dev is not None:
                 return dev
             if task.cancel_requested or loop.time() >= deadline:
@@ -288,7 +291,8 @@ class AgentController:
         # Surface the question(s) to the paired device/companion UI so the user can answer.
         prompt = {"task_id": task.id, "questions": composed, "choices": choices}
         self._pending_prompts[task.id] = ("ask_user", prompt)
-        device = self.devices.get(task.device_id) or self.devices.any()
+        device = (self.devices.get(task.device_id) if task.device_id
+                  else self.devices.any())     # never ask a different phone's user
         if device:
             try:
                 await device.push("ask_user", **prompt)
