@@ -194,21 +194,25 @@ class AgentController:
                              f"els={len(screen.elements)}")
         elif len(screen.elements) <= 6:
             task.log("note", f"no screenshot (vision/OCR unavailable), els={len(screen.elements)}")
+        from ..config import get_settings
+        s = get_settings()
         user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen,
-                                 ocr_items=ocr, feedback=feedback)
+                                 max_elements=s.max_elements_in_prompt, ocr_items=ocr,
+                                 feedback=feedback)
         last_err: Exception | None = None
-        # Populated screens: fast gpt-oss text call from the tree (+ grouping). Sparse
-        # screens, OR when the text path just got stuck (reflection feedback present):
-        # send the screenshot to Groq's vision model (qwen) to locate controls, falling
-        # back to text (tree + OCR) if vision errors. All on Groq, so fast. Escalating to
-        # vision when stuck gives the model "eyes" exactly when the tree wasn't enough
-        # (e.g. a dense/WebView booking screen it keeps misreading).
-        use_vision = bool(screen.screenshot_b64) and (len(screen.elements) <= 8 or bool(feedback))
+        # Populated screens: fast gpt-oss text call from the tree (+ grouping). Vision
+        # (qwen + a base64 image = many input tokens) is COST-GATED: only fire it on a
+        # sparse tree, or when the text path is stuck on a not-too-rich screen — on dense
+        # trees the text path is both better and cheaper, so paying for an image is waste.
+        n = len(screen.elements)
+        use_vision = bool(screen.screenshot_b64) and (
+            n <= s.vision_sparse_max or (bool(feedback) and n <= s.vision_stuck_max))
         attempts = [screen.screenshot_b64, None] if use_vision else [None, None]
         for image in attempts:
             try:
                 data = await self.llm.complete_json(
-                    ACTION_SYSTEM, user, temperature=0.1, max_tokens=1200, image_b64=image)
+                    ACTION_SYSTEM, user, temperature=0.1,
+                    max_tokens=s.action_max_tokens, image_b64=image)
                 return AgentAction(**data)
             except (LLMError, ValueError, TypeError) as e:
                 last_err = e

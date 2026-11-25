@@ -177,7 +177,7 @@ def build_action_user(goal: str, facts: dict, plan_summary: str,
     ]
     more = "" if len(screen.elements) <= max_elements else \
         f"\n(+{len(screen.elements) - max_elements} more elements not shown — scroll if needed)"
-    hist = "\n".join(f"  {h}" for h in history[-8:]) or "  (none yet)"
+    hist = "\n".join(f"  {h}" for h in history[-6:]) or "  (none yet)"
     reflection = f"{feedback}\n" if feedback else ""
     return (
         "MODE: action\n"

@@ -22,22 +22,30 @@ class LLMRouter(LLMProvider):
     name = "router"
 
     def __init__(self, settings: Settings):
-        self.chain: list[LLMProvider] = []
+        self.chain: list[LLMProvider] = []        # capable model: per-step action loop
+        self.fast_chain: list[LLMProvider] = []   # cheaper model: intent + planning
         if settings.has_groq:
             self.chain.append(GroqProvider(settings.groq_api_key, settings.groq_model,
                                            settings.groq_vision_model))
+            self.fast_chain.append(GroqProvider(settings.groq_api_key, settings.groq_fast_model,
+                                                settings.groq_vision_model))
         if settings.has_gemini and settings.use_gemini:
-            self.chain.append(GeminiProvider(settings.gemini_api_key, settings.gemini_model))
-        self.chain.append(MockProvider())  # never fully down
-        log.info("LLM chain: %s", " -> ".join(p.name for p in self.chain))
+            gem = GeminiProvider(settings.gemini_api_key, settings.gemini_model)
+            self.chain.append(gem)
+            self.fast_chain.append(gem)
+        self.chain.append(MockProvider())       # never fully down
+        self.fast_chain.append(MockProvider())
+        log.info("LLM chain: %s | fast: %s",
+                 " -> ".join(p.name for p in self.chain),
+                 " -> ".join(p.name for p in self.fast_chain))
 
     @property
     def active(self) -> str:
         return self.chain[0].name if self.chain else "none"
 
-    async def complete(self, system: str, user: str, **kw) -> str:
+    async def _run(self, chain: list[LLMProvider], system: str, user: str, **kw) -> str:
         last: Exception | None = None
-        for provider in self.chain:
+        for provider in chain:
             try:
                 return await provider.complete(system, user, **kw)
             except LLMError as e:
@@ -45,9 +53,12 @@ class LLMRouter(LLMProvider):
                 log.warning("provider %s failed, falling back: %s", provider.name, e)
         raise LLMError(f"All providers failed: {last}")
 
-    async def complete_json(self, system: str, user: str, **kw) -> dict:
-        return extract_json(await self.complete(system, user, json_mode=True, **kw))
+    async def complete(self, system: str, user: str, **kw) -> str:
+        return await self._run(self.chain, system, user, **kw)
 
-    # Back-compat: the action loop may call this; it's the same fast Groq-first chain.
+    async def complete_json(self, system: str, user: str, **kw) -> dict:
+        return extract_json(await self._run(self.chain, system, user, json_mode=True, **kw))
+
+    # Cheaper model path for the simpler structured calls (intent + planning).
     async def complete_json_fast(self, system: str, user: str, **kw) -> dict:
-        return await self.complete_json(system, user, **kw)
+        return extract_json(await self._run(self.fast_chain, system, user, json_mode=True, **kw))

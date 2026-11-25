@@ -10,10 +10,28 @@ class Settings(BaseSettings):
 
     # LLM
     groq_api_key: str = ""
+    # Capable model for the per-step action decisions (quality matters most here).
     groq_model: str = "openai/gpt-oss-120b"
+    # Cheaper, smaller model for the simpler structured calls (intent + planning), which
+    # run once per task. Big cost saving with negligible quality loss; set GROQ_FAST_MODEL
+    # equal to GROQ_MODEL to disable the split.
+    groq_fast_model: str = "openai/gpt-oss-20b"
     # Groq's multimodal model, used for action decisions on sparse screens when a
     # screenshot is available (same GROQ_API_KEY, fast). Override if Groq rotates it.
     groq_vision_model: str = "qwen/qwen3.8-27b"
+
+    # --- Cost controls (tune the quality/spend trade-off; all overridable via env) --- #
+    # Action JSON is tiny, so a tight output cap cuts output-token cost ~40% with no
+    # quality loss. Vision (an image = many input tokens) is gated to only fire when it
+    # actually helps: a sparse tree, or when the text path is stuck on a not-too-rich
+    # screen (on dense trees the text path is both better AND cheaper).
+    action_max_tokens: int = 700
+    intent_max_tokens: int = 500
+    plan_max_tokens: int = 600
+    vision_sparse_max: int = 8      # use vision when a screen has <= this many elements
+    vision_stuck_max: int = 28      # ...or when stuck, but only up to this element count
+    max_elements_in_prompt: int = 55
+    history_in_prompt: int = 6
     # Groq voice models for the assistant (same GROQ_API_KEY).
     groq_tts_model: str = "playai-tts"
     groq_tts_voice: str = "Fritz-PlayAI"

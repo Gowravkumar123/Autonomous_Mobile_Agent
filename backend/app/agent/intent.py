@@ -41,9 +41,11 @@ def normalize_facts(facts: dict) -> dict:
 
 async def analyze_intent(task: Task, llm: LLMRouter) -> None:
     """Fill goal / skill / app_hint / facts / clarifications on the task."""
+    from ..config import get_settings
+    s = get_settings()
     try:
-        data = await llm.complete_json(INTENT_SYSTEM, build_intent_user(task.prompt),
-                                        temperature=0.1, max_tokens=700)
+        data = await llm.complete_json_fast(INTENT_SYSTEM, build_intent_user(task.prompt),
+                                            temperature=0.1, max_tokens=s.intent_max_tokens)
     except LLMError as e:
         log.warning("intent analysis failed: %s", e)
         data = {"goal": task.prompt, "skill": "generic", "facts": {}, "clarifications": []}
@@ -90,11 +92,13 @@ async def analyze_intent(task: Task, llm: LLMRouter) -> None:
 
 
 async def make_plan(task: Task, llm: LLMRouter) -> None:
+    from ..config import get_settings
+    s = get_settings()
     skill = registry.get(task.skill)
     try:
-        data = await llm.complete_json(
+        data = await llm.complete_json_fast(
             PLAN_SYSTEM, build_plan_user(task.goal, task.facts, skill.playbook),
-            temperature=0.2, max_tokens=800)
+            temperature=0.2, max_tokens=s.plan_max_tokens)
         task.plan = data.get("steps") or []
         task.approval_boundary = data.get("approval_boundary") or skill.approval_boundary
     except LLMError as e:
