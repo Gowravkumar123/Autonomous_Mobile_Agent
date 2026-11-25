@@ -58,6 +58,15 @@ async def lifespan(app: FastAPI):
             n = await app.state.store.hydrate()
             log.info("Restored %d task(s) from Postgres", n)
 
+    # Tool layer: built-in research tools + every MCP server in the config file.
+    from .tools import ToolRegistry
+    app.state.tools = ToolRegistry.from_file(
+        s.mcp_config_path, builtins=s.tools_builtin, timeout_s=s.tool_timeout_s,
+        rate_per_minute=s.tool_rate_per_minute, max_calls_per_task=s.tool_max_calls_per_task)
+    await app.state.tools.start()
+    app.state.controller.tools = app.state.tools
+    log.info("Tools: %s", app.state.tools.status())
+
     # Authentication (needs the DB for the device registry, so it comes after).
     app.state.auth = AuthManager(s.auth_secret, app.state.db, s.auth_token_days)
     await app.state.auth.load()
@@ -69,6 +78,7 @@ async def lifespan(app: FastAPI):
              "postgres" if app.state.db else "in-memory",
              "on" if app.state.auth.enabled else "OFF")
     yield
+    await app.state.tools.stop()     # stop MCP server processes / sessions
     if app.state.db:
         await app.state.db.close()   # flush pending writes on shutdown
 
@@ -99,7 +109,7 @@ def _task_view(task: Task, full: bool = False) -> dict:
     view = {
         "task_id": task.id, "state": task.state.value, "prompt": task.prompt,
         "device_id": task.device_id, "owner": task.owner, "executor": task.executor,
-        "evidence": task.evidence,
+        "evidence": task.evidence, "tool_results": task.tool_results,
         "goal": task.goal, "skill": task.skill, "app_hint": task.app_hint,
         "facts": task.facts, "plan": task.plan, "approval_boundary": task.approval_boundary,
         "summary": task.summary, "error": task.error, "step_id": task.step_id,
@@ -119,7 +129,8 @@ async def health(request: Request):
     from .vision.ocr import available as ocr_available
     body = {"ok": True, "llm": app.state.llm.active, "ocr": ocr_available(),
             "db": "postgres" if app.state.db else "in-memory",
-            "auth": "on" if app.state.auth.enabled else "OFF"}
+            "auth": "on" if app.state.auth.enabled else "OFF",
+            "tools": len(app.state.tools.list())}
     if optional_principal(request) is not None:          # details only for signed-in callers
         body["devices"] = list(app.state.devices._sessions.keys())
     return body
@@ -190,6 +201,23 @@ class Answer(BaseModel):
     facts: dict = {}
 
 
+@app.get("/v1/tools")
+async def list_tools(p: Principal = Depends(principal)):
+    """Tool catalog with each tool's effective policy (allow / approve / deny) and schema.
+    There is deliberately NO endpoint to call a tool directly — every call goes through
+    a task and the policy gate."""
+    tools = [t.brief() for t in app.state.tools.list()]
+    if p.is_admin:
+        return {"status": app.state.tools.status(), "tools": tools}
+    return {"tools": [{k: t[k] for k in ("name", "description", "policy")} for t in tools]}
+
+
+@app.post("/v1/tools/refresh")
+async def refresh_tools(_: Principal = Depends(admin)):
+    """Reconnect every MCP server and re-list its tools (after editing the config)."""
+    return await app.state.tools.refresh()
+
+
 @app.get("/skills")
 async def skills(_: Principal = Depends(principal)):
     return [{"key": s.key, "title": s.title, "apps": s.app_packages,
@@ -202,8 +230,8 @@ async def create_task(body: CreateTask, p: Principal = Depends(principal)):
     # A device can only start tasks on itself; an admin may target any device.
     device_id = p.sub if p.scope == "device" else body.device_id
     executor = body.executor.strip().lower()
-    if executor not in ("auto", "mobile", "browser", ""):
-        raise HTTPException(422, "executor must be auto, mobile or browser")
+    if executor not in ("auto", "mobile", "browser", "api", ""):
+        raise HTTPException(422, "executor must be auto, mobile, browser or api")
     if body.start_url and not body.start_url.startswith(("http://", "https://")):
         raise HTTPException(422, "start_url must be an http(s) URL")
     task = Task(prompt=body.prompt, device_id=device_id, owner=p.sub,

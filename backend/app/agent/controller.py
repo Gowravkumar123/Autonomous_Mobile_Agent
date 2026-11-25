@@ -10,6 +10,7 @@ can pause and resume across device disconnection.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -53,6 +54,7 @@ class AgentController:
         self._approval_records: dict[str, ApprovalRecord] = {}
         self._resume: dict[str, asyncio.Event] = {}
         self.approval_ttl_s = 900.0
+        self.tools = None   # app.tools.ToolRegistry (built-in + MCP), set by the app
         self._graph = None  # compiled lazily (imports langgraph on first run)
 
     async def on_device_connected(self, session: DeviceSession) -> None:
@@ -188,12 +190,12 @@ class AgentController:
     # Main driver
     # ----------------------------------------------------------------- #
     async def run_task(self, task: Task) -> None:
-        browser = None
+        session = None
         try:
             await self._plan_phase(task)
             if task.state in TERMINAL:
                 return
-            browser = await self._select_executor(task)
+            session = await self._select_executor(task)
             if task.state in TERMINAL:
                 return
             await self._execute_phase(task)
@@ -206,8 +208,13 @@ class AgentController:
         finally:
             self._approvals.pop(task.id, None)
             self._answers.pop(task.id, None)
-            if browser is not None:
-                await self._close_browser(task, browser)
+            if session is not None:
+                if getattr(session, "kind", "") == "browser":
+                    await self._close_browser(task, session)
+                else:
+                    self.devices.remove(session.device_id, session)
+            if self.tools is not None:
+                self.tools.forget_task(task.id)
 
     # ----------------------------------------------------------------- #
     # select_executor (blueprint): mobile (paired phone) or browser (Playwright)
@@ -222,11 +229,14 @@ class AgentController:
         return any(getattr(d, "kind", "") != "browser" for d in self.devices._sessions.values())
 
     def _choose_executor(self, task: Task) -> str:
-        if task.executor in ("mobile", "browser"):
+        if task.executor in ("mobile", "browser", "api"):
             return task.executor
         if task.start_url or self._WEB_RE.search(task.prompt):
             return "browser"
-        if task.device_id and not task.device_id.startswith("browser-"):
+        # Intent judged the goal doable with the registered tools alone (no UI).
+        if task.executor_hint == "api" and self.tools is not None and self.tools.names():
+            return "api"
+        if task.device_id and not task.device_id.startswith(("browser-", "api-")):
             return "mobile"
         return "mobile" if self._phone_connected() else "browser"
 
@@ -235,6 +245,19 @@ class AgentController:
         from ..config import get_settings
         s = get_settings()
         task.executor = self._choose_executor(task)
+        if task.executor == "api":
+            if self.tools is None or not self.tools.names():
+                task.set_state(TaskState.FAILED, "API executor chosen but no tools are available")
+                return None
+            from ..executors.api import ToolSession
+            session = ToolSession(f"api-{task.id}",
+                                  notify=lambda t, d: self._notify_owner(task, t, d))
+            task.device_id = session.device_id
+            self.devices.add(session)
+            audit(task.id, "executor", "api", tools=self.tools.names())
+            task.log("note", f"executor: api ({len(self.tools.names())} tools)")
+            self._emit(task)
+            return session
         if task.executor != "browser":
             audit(task.id, "executor", "mobile", device=task.device_id)
             task.log("note", f"executor: mobile ({task.device_id or 'any phone'})")
@@ -274,6 +297,68 @@ class AgentController:
         self._emit(task)
         return session
 
+    # ----------------------------------------------------------------- #
+    # Tool calls (blueprint: unified tool execution layer behind the policy gate)
+    # ----------------------------------------------------------------- #
+    async def run_tool(self, task: Task, action: AgentAction, screen: ScreenObservation,
+                       state: dict | None = None) -> dict:
+        """Every tool call goes through here: lookup -> policy (deny/approve/allow) ->
+        schema validation -> transaction-bound approval -> dispatch -> normalized result
+        fed back to the model as the next observation. Never trusts the model's args."""
+        from ..policy.engine import PolicyDecision
+        from ..tools.base import APPROVE, DENY, ToolError
+        name, args = (action.tool or "").strip(), dict(action.args or {})
+        spec = self.tools.get(name) if self.tools is not None else None
+
+        def record(ok: bool, text: str, *, cached: bool = False, error: str = "",
+                   elapsed: float = 0.0) -> dict:
+            task.tool_results.append({"tool": name, "args": args, "ok": ok,
+                                      "text": text[:1500], "cached": cached})
+            del task.tool_results[:-12]                     # keep the last 12
+            short = json.dumps(args, default=str)
+            short = short if len(short) <= 80 else short[:77] + "..."
+            label = f"call {name}({short}) -> {'ok' if ok else 'error'}" + \
+                    (" (cached)" if cached else "")
+            task.history.append(label)
+            self.store.publish(task.id, "tool", label, ok=ok)
+            audit(task.id, "tool_call", name, args=args, ok=ok, error=error[:300],
+                  cached=cached, elapsed_s=round(elapsed, 3))
+            if self.store.db is not None:
+                self.store.db.enqueue_tool_run(task.id, task.step_id, name,
+                                               self.tools.args_hash(name, args) if self.tools else "",
+                                               ok, (text if ok else error)[:2000], elapsed)
+            return {"status": "run", "pending_validate": False, "feedback": ""}
+
+        if spec is None:
+            return record(False, f"unknown tool '{name}' — use one from AVAILABLE TOOLS",
+                          error="unknown tool")
+        if spec.policy == DENY:
+            return record(False, f"{name} is DENIED by policy — do this another way or stop",
+                          error="denied by policy")
+        try:
+            self.tools.validate(spec, args)
+        except ToolError as e:
+            return record(False, str(e), error=str(e))
+
+        if spec.policy == APPROVE and not (task.pre_authorized and spec.risk <= 3):
+            why = ("financial tool" if spec.risk >= 4 else
+                   "tool that changes data" if not spec.read_only else "tool from an untrusted server")
+            decision = PolicyDecision(False, action, True, spec.risk,
+                                      f"{why}: {name}({json.dumps(args, default=str)[:160]})")
+            device = (self.devices.get(task.device_id) if task.device_id else None)
+            outcome, _ = await self._approval_pause(task, device, decision, action, screen)
+            if task.cancel_requested or outcome != "approved":
+                task.set_state(TaskState.CANCELLED,
+                               "approval expired — tool not called" if outcome == "expired"
+                               else "user declined the tool call")
+                return {"status": "cancelled"}
+            task.approvals_granted += 1
+            task.set_state(TaskState.RUNNING)
+
+        res = await self.tools.call(spec, args, task.id)
+        return record(res.ok, res.for_model(), cached=res.cached, error=res.error,
+                      elapsed=res.elapsed_s)
+
     async def _notify_owner(self, task: Task, type_: str, data: dict) -> None:
         """Browser tasks have no screen of their own: surface their questions/approvals on
         the owner's phone if it's connected (else the user answers via the API)."""
@@ -303,7 +388,8 @@ class AgentController:
     async def _plan_phase(self, task: Task) -> None:
         task.set_state(TaskState.PLANNING)
         self._emit(task)
-        await analyze_intent(task, self.llm)
+        await analyze_intent(task, self.llm,
+                             self.tools.names() if self.tools is not None else None)
         await make_plan(task, self.llm)
         audit(task.id, "plan", task.goal, skill=task.skill, plan=task.plan)
         self._emit(task)
@@ -378,13 +464,19 @@ class AgentController:
             task.log("note", f"OCR: {'on' if available() else 'OFF'}, {len(ocr)} items, "
                              f"shot={'yes' if screen.screenshot_b64 else 'no'}, "
                              f"els={len(screen.elements)}")
-        elif len(screen.elements) <= 6:
+        elif len(screen.elements) <= 6 and task.executor != "api":
             task.log("note", f"no screenshot (vision/OCR unavailable), els={len(screen.elements)}")
         from ..config import get_settings
         s = get_settings()
+        # Tool catalog costs prompt tokens every step: always for the API executor, and for
+        # UI tasks only when enabled (TOOLS_IN_UI_TASKS) — keeps phone/browser prompts lean.
+        catalog = ""
+        if self.tools is not None and (task.executor == "api" or s.tools_in_ui_tasks):
+            catalog = self.tools.catalog()
         user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen,
                                  max_elements=s.max_elements_in_prompt, ocr_items=ocr,
-                                 feedback=feedback, executor=task.executor)
+                                 feedback=feedback, executor=task.executor,
+                                 tools_catalog=catalog, tool_results=task.tool_results[-5:])
         last_err: Exception | None = None
         # Populated screens: fast gpt-oss text call from the tree (+ grouping). Vision
         # (qwen + a base64 image = many input tokens) is COST-GATED: only fire it on a
@@ -453,10 +545,11 @@ class AgentController:
         task.set_state(TaskState.WAITING_FOR_USER, decision.reason)
         self._emit(task)
         self._pending_prompts[task.id] = ("approval_request", payload)
-        try:
-            await device.push("approval_request", **payload)
-        except Exception as e:
-            log.warning("approval push failed (will re-deliver on reconnect): %s", e)
+        if device is not None:            # no device: decided via the API / on reconnect
+            try:
+                await device.push("approval_request", **payload)
+            except Exception as e:
+                log.warning("approval push failed (will re-deliver on reconnect): %s", e)
         self.store.publish(task.id, "approval", decision.reason, approval=payload)
         audit(task.id, "approval_requested", decision.reason, approval=payload)
 

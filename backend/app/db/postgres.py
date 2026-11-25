@@ -62,6 +62,20 @@ SCHEMA = [
     """,
     "CREATE INDEX IF NOT EXISTS audit_task_idx ON audit_events (task_id)",
     """
+    CREATE TABLE IF NOT EXISTS tool_runs (
+        run_id       bigserial PRIMARY KEY,
+        task_id      text,
+        step_id      integer,
+        tool_name    text NOT NULL,
+        inputs_hash  text,
+        ok           boolean,
+        result       text,
+        elapsed_s    double precision,
+        ts           timestamptz NOT NULL DEFAULT now()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS tool_runs_task_idx ON tool_runs (task_id)",
+    """
     CREATE TABLE IF NOT EXISTS approvals (
         approval_id  text PRIMARY KEY,
         task_id      text NOT NULL,
@@ -102,6 +116,9 @@ _UPSERT_TAIL = """
 """
 _AUDIT_ROW = "(%s, %s, %s, %s, %s::jsonb)"
 _AUDIT_HEAD = "INSERT INTO audit_events (task_id, actor, action, detail, data) VALUES "
+_TOOLRUN_ROW = "(%s, %s, %s, %s, %s, %s, %s)"
+_TOOLRUN_HEAD = ("INSERT INTO tool_runs (task_id, step_id, tool_name, inputs_hash, ok, result, "
+                 "elapsed_s) VALUES ")
 _CHUNK = 400   # rows per statement (stays far below Postgres' 65535-parameter limit)
 
 
@@ -138,6 +155,7 @@ class Database:
         self._conn = None
         self._dirty: dict[str, dict] = {}      # task_id -> latest snapshot
         self._audit: list[tuple] = []           # pending audit rows
+        self._tool_runs: list[tuple] = []       # pending tool_runs rows
         self._flush_scheduled = False
 
     # ------------------------------------------------------------------ #
@@ -210,6 +228,14 @@ class Database:
         self._audit.append((task_id, actor, action, detail, json.dumps(data or {}, default=str)))
         self._schedule_flush()
 
+    def enqueue_tool_run(self, task_id: str, step_id: int, tool_name: str, inputs_hash: str,
+                         ok: bool, result: str, elapsed_s: float) -> None:
+        if not self.ok:
+            return
+        self._tool_runs.append((task_id, step_id, tool_name, inputs_hash, ok, result,
+                                float(elapsed_s)))
+        self._schedule_flush()
+
     def _schedule_flush(self) -> None:
         if self._flush_scheduled:
             return
@@ -226,7 +252,8 @@ class Database:
         tasks = list(self._dirty.values())
         self._dirty.clear()
         audits, self._audit = self._audit, []
-        if not tasks and not audits:
+        runs, self._tool_runs = self._tool_runs, []
+        if not tasks and not audits and not runs:
             return
 
         def work(conn):
@@ -235,6 +262,8 @@ class Database:
                                       [_task_params(t) for t in tasks], _UPSERT_TAIL):
                 cur.execute(sql, params)
             for sql, params in _multi(_AUDIT_HEAD, _AUDIT_ROW, audits):
+                cur.execute(sql, params)
+            for sql, params in _multi(_TOOLRUN_HEAD, _TOOLRUN_ROW, runs):
                 cur.execute(sql, params)
             conn.commit()
         try:

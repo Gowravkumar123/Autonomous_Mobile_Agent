@@ -87,6 +87,7 @@ class ActionType(str, Enum):
     HOME = "home"
     OPEN_APP = "open_app"
     WAIT = "wait"
+    CALL_TOOL = "call_tool"      # invoke a registered tool (built-in or MCP) with JSON args
     # Terminal / control signals (handled by the brain, surfaced to the phone/UI):
     ASK_USER = "ask_user"        # need a clarification before proceeding
     REQUEST_APPROVAL = "approve" # sensitive step: hand control to the user
@@ -109,10 +110,28 @@ class AgentAction(BaseModel):
     # For ASK_USER: concrete choices to offer the user (so the phone can read/show them).
     options: list[str] = Field(default_factory=list,
                                description="2-5 short choices to present when type=ask_user.")
+    # For CALL_TOOL: registered tool name and its JSON arguments.
+    tool: Optional[str] = Field(None, description="Tool name from the AVAILABLE TOOLS list.")
+    args: dict[str, Any] = Field(default_factory=dict, description="Tool arguments (JSON).")
 
     # Risk metadata filled in by the policy engine (NOT trusted from the LLM).
     risk_level: int = 0
     risk_reason: str = ""
+
+    @field_validator("args", mode="before")
+    @classmethod
+    def _coerce_args(cls, v: Any) -> dict:
+        # Models emit "args": null for non-tool actions, or a JSON string instead of an object.
+        if v is None or v == "":
+            return {}
+        if isinstance(v, str):
+            import json
+            try:
+                parsed = json.loads(v)
+                return parsed if isinstance(parsed, dict) else {}
+            except ValueError:
+                return {}
+        return v
 
     @field_validator("options", mode="before")
     @classmethod

@@ -59,6 +59,20 @@ log = logging.getLogger("agent.graph")
 
 MAX_STEPS = 40                 # hard cap on ReAct cycles per task
 MAX_REACT_ATTEMPTS = 4         # reflection re-loop cap (ReAct self-correction)
+MAX_QUESTIONS = 3              # clarifying questions per task (breaks ask-loops)
+
+_GO = re.compile(r"^(yes|yeah|ok|okay|sure|save|confirm|proceed|go ahead|continue|do it|send|"
+                 r"submit|create|book|add|apply)\b", re.I)
+_NO_GO = re.compile(r"^(no|nope|cancel|don'?t|do not|skip|abort|stop|not now|never mind)\b", re.I)
+
+
+def _is_go_no_go(action: AgentAction) -> bool:
+    """A two-option 'proceed or not?' question (e.g. 'Save note' / 'Cancel')."""
+    opts = [o.strip() for o in (action.options or []) if o and o.strip()]
+    if len(opts) != 2:
+        return False
+    a, b = opts
+    return bool((_GO.match(a) and _NO_GO.match(b)) or (_NO_GO.match(a) and _GO.match(b)))
 
 # Tools whose whole point is to move the UI forward: if one of these fires and the
 # screen does not change at all, it did not work -> the validator reflects. (TYPE and
@@ -196,7 +210,8 @@ def build_react_graph(controller):
 
             # Blind screen: no tree AND no screenshot -> usually a FLAG_SECURE
             # payment/checkout screen. Don't tap blindly; wait, then hand over.
-            if not screen.elements and not screen.screenshot_b64:
+            # (The API/MCP executor has no screen at all — that's expected, not blind.)
+            if task.executor != "api" and not screen.elements and not screen.screenshot_b64:
                 blind += 1
                 if blind >= 3:
                     task.summary = ("A protected screen (likely payment/checkout) is blocking "
@@ -312,7 +327,7 @@ def build_react_graph(controller):
         # reason about a near-blank screen. This is the #1 cause of the agent "asking
         # instead of acting" at the start. Capped so a non-launching app can't loop.
         opens = state.get("opens", 0)
-        if (task.executor != "browser" and skill.app_packages
+        if (task.executor not in ("browser", "api") and skill.app_packages
                 and screen.app_package not in skill.app_packages and opens < 2):
             name = _target_app_name(skill)
             task.log("action", "open_app", thought=f"Not in the target app; opening {name}.")
@@ -347,8 +362,22 @@ def build_react_graph(controller):
                                      expectation="advance to the next booking step")
                 state["action"] = action
 
+        # ---- tool call (built-in or MCP) — no device involved ----
+        if action.type == ActionType.CALL_TOOL:
+            return await c.run_tool(task, action, screen, state)
+
         # ---- terminal / control tools ----
         if action.type == ActionType.DONE:
+            if task.executor == "api":
+                # Verified only by a real runtime result: at least one successful tool call.
+                verified = any(r.get("ok") for r in task.tool_results)
+                answer = (action.text or "").strip()
+                task.summary = (("[OK] " if verified else "[UNVERIFIED] ") +
+                                (answer or task.goal))
+                task.set_state(TaskState.COMPLETED if verified else TaskState.WAITING_FOR_USER,
+                               "answered from tool results" if verified
+                               else "model reported done without a successful tool result")
+                return {"status": "done" if verified else "waiting"}
             verified = is_success(screen, skill, task)
             task.summary = c._summarize(task, success=verified)
             task.set_state(TaskState.COMPLETED if verified else TaskState.WAITING_FOR_USER,
@@ -359,6 +388,25 @@ def build_react_graph(controller):
             task.set_state(TaskState.FAILED, task.error or "agent could not proceed")
             return {"status": "failed"}
         if action.type == ActionType.ASK_USER:
+            # Redundant go/no-go ("save it? Save / Cancel"): the user already asked for this
+            # and the PLATFORM's approval gate still guards anything risky, so skipping the
+            # model's own confirmation can never bypass a real approval. The model ignores
+            # "don't confirm" instructions, so this is enforced in code.
+            if _is_go_no_go(action):
+                task.log("note", "skipped a redundant confirmation question (platform approval "
+                                 "still applies) — proceeding")
+                return {"status": "run", "pending_validate": False,
+                        "feedback": "Do NOT ask for confirmation — the user already requested "
+                                    "this, and the platform asks for approval itself where "
+                                    "needed. Perform the action now."}
+            asked = sum(1 for e in task.events if e.kind == "state_change"
+                        and e.detail == "needs clarification")
+            if asked >= MAX_QUESTIONS:
+                task.log("note", f"question cap ({MAX_QUESTIONS}) reached — not asking again")
+                return {"status": "run", "pending_validate": False,
+                        "feedback": "You have asked the user enough. Do not ask again: make a "
+                                    "sensible choice yourself and proceed, or `fail` if truly "
+                                    "blocked."}
             facts = await c._ask_user(task, [action.text or "I need more information."],
                                       [list(action.options or [])])
             if task.cancel_requested:

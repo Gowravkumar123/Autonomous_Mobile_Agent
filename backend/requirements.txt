@@ -28,3 +28,7 @@ pyjwt
 #   python -m playwright install --with-deps chromium
 # Optional: without it the agent still runs on the phone; browser tasks fail cleanly.
 playwright
+
+# Tool layer: Model Context Protocol client (v2 SDK) + JSON-schema validation of tool args
+mcp
+jsonschema

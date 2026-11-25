@@ -6,6 +6,8 @@ backend/.env
 backend/audit_logs/
 # Browser-executor screenshots of real task pages (may contain personal data)
 backend/evidence/
+# Real MCP server config (may contain endpoints/tokens); see mcp_servers.example.json
+backend/mcp_servers.json
 
 # Android / Gradle
 android/.gradle/

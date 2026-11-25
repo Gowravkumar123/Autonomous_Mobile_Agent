@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy to mcp_servers.json (gitignored). Secrets go in backend/.env and are referenced as ${VAR}. Per-tool policy: allow | approve | deny. Without trust_annotations every tool needs approval.",
+  "servers": {
+    "demo": {
+      "command": "python",
+      "args": ["-m", "tests.mcp_test_server"],
+      "trust_annotations": true,
+      "tools": { "delete_all_notes": "deny" }
+    },
+    "github": {
+      "disabled": true,
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": { "Authorization": "Bearer ${GITHUB_MCP_TOKEN}" },
+      "default_policy": "approve",
+      "tools": { "get_me": "allow", "search_repositories": "allow" }
+    }
+  }
+}

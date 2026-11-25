@@ -39,12 +39,14 @@ def normalize_facts(facts: dict) -> dict:
     return out
 
 
-async def analyze_intent(task: Task, llm: LLMRouter) -> None:
-    """Fill goal / skill / app_hint / facts / clarifications on the task."""
+async def analyze_intent(task: Task, llm: LLMRouter,
+                         tool_names: list[str] | None = None) -> None:
+    """Fill goal / skill / app_hint / facts / clarifications / executor_hint on the task."""
     from ..config import get_settings
     s = get_settings()
     try:
-        data = await llm.complete_json_fast(INTENT_SYSTEM, build_intent_user(task.prompt),
+        data = await llm.complete_json_fast(INTENT_SYSTEM,
+                                            build_intent_user(task.prompt, tool_names),
                                             temperature=0.1, max_tokens=s.intent_max_tokens)
     except LLMError as e:
         log.warning("intent analysis failed: %s", e)
@@ -53,6 +55,8 @@ async def analyze_intent(task: Task, llm: LLMRouter) -> None:
     task.goal = data.get("goal") or task.prompt
     task.skill = (data.get("skill") or "generic").strip().lower()
     task.facts = normalize_facts(data.get("facts") or {})
+    hint = str(data.get("executor_hint") or "").strip().lower()
+    task.executor_hint = "api" if (hint == "api" and tool_names) else ""
 
     # Clarifications may be plain strings or {question, choices} objects. Normalize to
     # parallel lists: question text + its concrete choices (so the phone can offer them).

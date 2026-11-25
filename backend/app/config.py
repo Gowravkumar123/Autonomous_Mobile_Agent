@@ -68,6 +68,16 @@ class Settings(BaseSettings):
     browser_search_url: str = "https://duckduckgo.com/html/?q={q}"
     browser_max_sessions: int = 2      # concurrent browser tasks (resource limit)
 
+    # Tools (built-in + MCP servers). The MCP config file is gitignored (it may reference
+    # secrets as ${ENV_VAR}); see mcp_servers.example.json.
+    mcp_config_path: str = "mcp_servers.json"
+    tools_builtin: bool = True         # web.search / web.fetch research tools
+    tool_timeout_s: float = 30.0
+    tool_rate_per_minute: int = 30     # per tool
+    tool_max_calls_per_task: int = 25
+    # Show the tool catalog to phone/browser tasks too (costs prompt tokens every step).
+    tools_in_ui_tasks: bool = False
+
     # Server
     host: str = "0.0.0.0"
     port: int = 8000

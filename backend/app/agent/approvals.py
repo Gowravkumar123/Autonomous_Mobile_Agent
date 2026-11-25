@@ -33,8 +33,11 @@ def action_binding(action: AgentAction, screen: ScreenObservation) -> str:
         "target": _element_label(action.ref, screen).strip(),
         "amount": _detect_amount(_screen_text(screen)),
         "app": screen.app_package,
+        # Tool calls: the approval covers this exact tool with these exact arguments.
+        "tool": getattr(action, "tool", None) or "",
+        "args": getattr(action, "args", None) or {},
     }
-    return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode()).hexdigest()
 
 
 @dataclass

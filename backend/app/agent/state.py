@@ -41,6 +41,9 @@ class Task(BaseModel):
     executor: str = ""             # "mobile" | "browser" ("" = auto-select after planning)
     start_url: str = ""            # optional starting page for the browser executor
     evidence: list[str] = Field(default_factory=list)   # e.g. final screenshot paths
+    executor_hint: str = ""        # intent's suggestion: "api" if tools alone can do it
+    # Normalized results of tool calls, newest last: {tool, args, ok, text, cached}.
+    tool_results: list[dict] = Field(default_factory=list)
     prompt: str = ""
     state: TaskState = TaskState.CREATED
 
