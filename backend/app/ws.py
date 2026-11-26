@@ -69,8 +69,13 @@ class DeviceSession:
 
 
 class DeviceRegistry:
+    """Sessions on THIS worker (`_sessions`), plus proxies for devices connected to other
+    workers (`_remote`, maintained by app.cluster). `get()` prefers the local socket."""
+
     def __init__(self) -> None:
         self._sessions: dict[str, DeviceSession] = {}
+        self._remote: dict[str, Any] = {}
+        self.cluster = None
 
     def add(self, session: DeviceSession) -> None:
         self._sessions[session.device_id] = session
@@ -92,7 +97,15 @@ class DeviceRegistry:
         log.info("device disconnected: %s", device_id)
 
     def get(self, device_id: str) -> DeviceSession | None:
+        return self._sessions.get(device_id) or self._remote.get(device_id)
+
+    def get_local(self, device_id: str) -> DeviceSession | None:
         return self._sessions.get(device_id)
 
+    def all(self) -> list:
+        """Every reachable session: local first, then remote proxies (cluster)."""
+        return list(self._sessions.values()) + [r for k, r in self._remote.items()
+                                                if k not in self._sessions]
+
     def any(self) -> DeviceSession | None:
-        return next(iter(self._sessions.values()), None)
+        return next(iter(self.all()), None)

@@ -18,6 +18,7 @@ class TaskStore:
         self._tasks: dict[str, Task] = {}
         self._subscribers: set[asyncio.Queue] = set()
         self.db = None  # optional app.db.postgres.Database — durable copy of every task
+        self.cluster = None  # optional app.cluster.RedisCluster — snapshots + event fan-out
 
     # ---- persistence (Postgres) ----
     async def hydrate(self) -> int:
@@ -42,8 +43,12 @@ class TaskStore:
 
     def schedule_persist(self, task: Task) -> None:
         """Non-blocking durable write (coalesced + batched by the DB layer)."""
+        data = None
         if self.db:
-            self.db.enqueue_task(task.model_dump(mode="json"))
+            data = task.model_dump(mode="json")
+            self.db.enqueue_task(data)
+        if self.cluster is not None and self.cluster.enabled:
+            self.cluster.put_snapshot(data or task.model_dump(mode="json"))
 
     def create(self, task: Task) -> Task:
         self._tasks[task.id] = task
@@ -66,7 +71,15 @@ class TaskStore:
         self._subscribers.discard(q)
 
     def publish(self, task_id: str, kind: str, detail: str = "", **data) -> None:
-        event = {"task_id": task_id, "kind": kind, "detail": detail, "data": data}
+        t = self._tasks.get(task_id)
+        # `owner` lets other workers' streams filter visibility without the task object.
+        event = {"task_id": task_id, "kind": kind, "detail": detail, "data": data,
+                 "owner": (t.owner or t.device_id) if t else ""}
+        self.publish_local(event)
+        if self.cluster is not None and self.cluster.enabled:
+            self.cluster.publish_event(event)
+
+    def publish_local(self, event: dict) -> None:
         for q in list(self._subscribers):
             try:
                 q.put_nowait(event)

@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     # Shared short-lived state (rate limits, pairing codes/lock, browser-session cap). Only
     # needed when running several workers; empty = in-process. e.g. rediss://...upstash.io
     redis_url: str = ""
+    # Multi-worker routing over Redis (device sockets, task control, events). On whenever
+    # REDIS_URL is set; CLUSTER_ENABLED=false keeps each worker standalone.
+    cluster_enabled: bool = True
 
     # Authentication. HMAC key for the signed admin/device tokens. EMPTY = auth DISABLED
     # (every endpoint open — only acceptable on a private network). Generate one with

@@ -74,6 +74,13 @@ def start_app() -> subprocess.Popen:
     raise RuntimeError("test app did not start")
 
 
+def app_has_focus() -> bool:
+    """Did the TEST APP become the foreground window? (The user may switch between their
+    own windows while the suite runs, so we don't compare the global foreground.)"""
+    fg = user32.GetForegroundWindow()
+    return bool(fg) and fg == user32.FindWindowW(None, TITLE)
+
+
 def stop_app(p: subprocess.Popen) -> None:
     p.kill()
     p.wait(10)
@@ -132,7 +139,6 @@ def unit_safety() -> None:
 # --------------------------------------------------------------------------- #
 async def unit_adapter() -> None:
     p = start_app()
-    fg_before = user32.GetForegroundWindow()
     s = safety()
     s.workspaces[0].mkdir(parents=True)
     d = WindowsDesktop(s, title_re=TITLE)
@@ -171,7 +177,7 @@ async def unit_adapter() -> None:
         check(not res["ok"] and "observe again" in res["error"], "stale/unknown ref refused")
         res = await d.run(d.act, {"type": "back"})
         check(not res["ok"], "unsupported actions return an error (no silent no-op)")
-        check(user32.GetForegroundWindow() == fg_before and
+        check(not app_has_focus() and
               user32.IsIconic(user32.FindWindowW(None, TITLE)),
               "no focus stolen: foreground unchanged, app still minimized")
 
@@ -184,7 +190,7 @@ async def unit_adapter() -> None:
         import base64
         check(shot is not None and base64.b64decode(shot)[:2] == b"\xff\xd8",
               "PrintWindow screenshot of the target window only (JPEG)")
-        check(user32.GetForegroundWindow() == fg_before, "...and still no focus change")
+        check(not app_has_focus(), "...and still no focus change")
 
         # Allowlist: same window, but powershell.exe NOT allowed.
         blocked = WindowsDesktop(safety(allowed_processes={"notepad.exe"}), title_re=TITLE)
@@ -232,7 +238,6 @@ async def e2e() -> None:
         await asyncio.sleep(0.05)
     base = f"http://127.0.0.1:{port}"
     p = start_app()
-    fg_before = user32.GetForegroundWindow()
     agent = None
     agent_task = None
     try:
@@ -369,7 +374,7 @@ async def e2e() -> None:
                   any("kill switch" in e.detail for e in task2.events),
                   "kill switch: device refuses + backend cancels the task")
             check(not el(o, "seatA1")["checked"], "...and nothing was changed on the desktop")
-            check(user32.GetForegroundWindow() == fg_before, "E2E never took focus")
+            check(not app_has_focus(), "E2E never took focus")
     finally:
         if agent is not None:
             await agent.close()

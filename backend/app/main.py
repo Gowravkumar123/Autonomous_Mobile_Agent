@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import (Depends, FastAPI, File, HTTPException, Request, Response, UploadFile,
@@ -17,7 +18,7 @@ from pydantic import BaseModel
 
 from .agent.controller import AgentController
 from .agent.memory import MemoryManager
-from .agent.state import TERMINAL, Task
+from .agent.state import TERMINAL, Task, TaskState
 from .auth import AuthError, AuthManager, Principal
 from .auth.deps import admin, optional_principal, principal, ws_principal
 from .config import get_settings
@@ -90,6 +91,11 @@ async def lifespan(app: FastAPI):
     app.state.kv = await make_kv(s.redis_url)
     app.state.tools.kv = app.state.kv
     app.state.controller.kv = app.state.kv
+    # Multi-worker routing (device sockets / task control / events) over the same Redis.
+    from .cluster import make_cluster
+    app.state.cluster = make_cluster(s.redis_url, s.cluster_enabled)
+    app.state.store.cluster = app.state.cluster
+    app.state.controller.cluster = app.state.cluster
 
     # Authentication (needs the DB for the device registry, so it comes after).
     app.state.auth = AuthManager(s.auth_secret, app.state.db, s.auth_token_days)
@@ -102,11 +108,13 @@ async def lifespan(app: FastAPI):
     # Compile the ReAct graph NOW: built lazily it cost the first task after every restart
     # ~6s (LangGraph import + compile) — found via the trace timeline.
     _ = app.state.controller.graph
+    await app.state.cluster.start(app.state)
 
     log.info("Agent backend ready. LLM: %s | DB: %s | auth: %s", app.state.llm.active,
              "postgres" if app.state.db else "in-memory",
              "on" if app.state.auth.enabled else "OFF")
     yield
+    await app.state.cluster.stop()   # withdraw this worker's devices from the directory
     await app.state.tools.stop()     # stop MCP server processes / sessions
     await app.state.kv.close()
     obs.shutdown()                   # flush pending spans to the exporter
@@ -129,11 +137,74 @@ def _visible(p: Principal, task: Task) -> bool:
     return p.is_admin or (p.scope == "device" and owner == p.sub)
 
 
-def _own_task(p: Principal, task_id: str) -> Task:
+async def _lookup(task_id: str) -> Task | None:
+    """This worker's live copy if it RUNS the task, else the freshest cluster snapshot
+    (the task may be running on another worker), else whatever this worker has."""
     task = app.state.store.get(task_id)
+    cl = app.state.cluster
+    if cl.enabled and not cl.runs_here(task_id):
+        snap = await cl.get_snapshot(task_id)
+        if snap:
+            try:
+                remote = Task(**snap)
+            except Exception:
+                return task
+            from .cluster import ORPHAN_GRACE_S
+            stale = time.time() - float(snap.get("snap_ts") or 0) > ORPHAN_GRACE_S
+            if remote.state not in TERMINAL and stale and not await cl.task_alive(task_id):
+                # Its worker died mid-task (heartbeat key expired): don't show it running.
+                remote.state = TaskState.FAILED
+                remote.error = remote.error or "the worker running this task went offline"
+            return remote
+    return task
+
+
+async def _own_task(p: Principal, task_id: str) -> Task:
+    task = await _lookup(task_id)
     if task is None or not _visible(p, task):
         raise HTTPException(404, "task not found")
     return task
+
+
+async def _all_tasks() -> list[Task]:
+    """Tasks known to this worker plus every worker's snapshots (newest first)."""
+    by_id = {t.id: t for t in app.state.store.all()}
+    cl = app.state.cluster
+    if cl.enabled:
+        for snap in await cl.list_snapshots():
+            if not cl.runs_here(snap.get("id", "")):
+                try:
+                    by_id[snap["id"]] = Task(**snap)
+                except Exception:
+                    continue
+    return sorted(by_id.values(), key=lambda t: t.created_at, reverse=True)
+
+
+READ_OPS = ("get_approval", "approvals_for", "trace")
+
+
+async def _ctl(task_id: str, op: str, **args):
+    """Run a control op where the task RUNS: here, or on the worker that owns it."""
+    from .cluster import RemoteError, control_local
+    args["task_id"] = task_id
+    cl = app.state.cluster
+    if cl.enabled and not cl.runs_here(task_id):
+        worker = await cl.task_worker(task_id)
+        if worker and worker != cl.worker_id:
+            try:
+                return await cl.control(worker, op, **args)
+            except RemoteError as e:
+                if op not in READ_OPS:
+                    raise HTTPException(503, f"task's worker unavailable: {e}")
+                # reads fall back to whatever this worker knows
+    return control_local(app.state.controller, op, args)
+
+
+async def _approval_task_id(approval_id: str) -> str | None:
+    rec = app.state.controller.get_approval(approval_id)
+    if rec is not None:
+        return rec.task_id
+    return await app.state.cluster.approval_task(approval_id)
 
 
 def _task_view(task: Task, full: bool = False) -> dict:
@@ -165,7 +236,7 @@ async def health(request: Request):
             "memory": (app.state.memory.embedder.name if app.state.memory else "off"),
             "state": app.state.kv.name, "tracing": app.state.tracing}
     if optional_principal(request) is not None:          # details only for signed-in callers
-        body["devices"] = list(app.state.devices._sessions.keys())
+        body["devices"] = [d.device_id for d in app.state.devices.all()]
     return body
 
 
@@ -199,19 +270,21 @@ async def pair_start(_: Principal = Depends(admin)):
 
 @app.get("/v1/devices")
 async def list_devices(_: Principal = Depends(admin)):
-    online = set(app.state.devices._sessions.keys())
+    online = {d.device_id for d in app.state.devices.all()}
     return [{**d, "online": d["device_id"] in online} for d in app.state.auth.list_devices()]
 
 
 @app.post("/v1/devices/{device_id}/revoke")
 async def revoke_device(device_id: str, _: Principal = Depends(admin)):
     ok = await app.state.auth.revoke(device_id)
-    session = app.state.devices.get(device_id)
+    session = app.state.devices.get_local(device_id)
     if session is not None:                       # kick its live socket immediately
         try:
             await session.socket.close(code=1008)
         except Exception:
             pass
+    else:
+        await app.state.cluster.kick(device_id)   # its socket is on another worker
     return {"revoked": ok}
 
 
@@ -336,33 +409,33 @@ async def create_task(body: CreateTask, p: Principal = Depends(principal)):
 @app.get("/v1/tasks")
 @app.get("/tasks")
 async def list_tasks(p: Principal = Depends(principal)):
-    return [_task_view(t) for t in app.state.store.all() if _visible(p, t)]
+    return [_task_view(t) for t in await _all_tasks() if _visible(p, t)]
 
 
 @app.get("/v1/tasks/{task_id}")
 @app.get("/tasks/{task_id}")
 async def get_task(task_id: str, p: Principal = Depends(principal)):
-    return _task_view(_own_task(p, task_id), full=True)
+    return _task_view(await _own_task(p, task_id), full=True)
 
 
 @app.post("/tasks/{task_id}/approve")
 async def approve(task_id: str, body: Approve, p: Principal = Depends(principal)):
     """Legacy: decide the task's current pending approval."""
-    _own_task(p, task_id)
-    return {"ok": app.state.controller.resolve_approval(task_id, body.approved, body.note,
-                                                        approver=p.sub)}
+    await _own_task(p, task_id)
+    return {"ok": await _ctl(task_id, "resolve_approval", approved=body.approved,
+                             note=body.note, approver=p.sub)}
 
 
 @app.post("/v1/tasks/{task_id}/pause")
 async def pause_task(task_id: str, p: Principal = Depends(principal)):
-    _own_task(p, task_id)
-    return {"ok": app.state.controller.pause(task_id)}
+    await _own_task(p, task_id)
+    return {"ok": await _ctl(task_id, "pause")}
 
 
 @app.post("/v1/tasks/{task_id}/resume")
 async def resume_task(task_id: str, p: Principal = Depends(principal)):
-    _own_task(p, task_id)
-    return {"ok": app.state.controller.resume(task_id)}
+    await _own_task(p, task_id)
+    return {"ok": await _ctl(task_id, "resume")}
 
 
 @app.get("/v1/tasks/{task_id}/trace")
@@ -370,8 +443,8 @@ async def task_trace(task_id: str, p: Principal = Depends(principal)):
     """Built-in timeline of the task's spans (works with no tracing backend): where the
     time went (model vs device vs human approval) and token usage / estimated cost."""
     from . import observability as obs
-    task = _own_task(p, task_id)
-    spans = obs.STORE.timeline(task_id)
+    task = await _own_task(p, task_id)
+    spans = obs.STORE.timeline(task_id) or (await _ctl(task_id, "trace") or [])
     by_kind: dict[str, float] = {}
     for s in spans:
         kind = s["name"].split(".")[0]
@@ -391,7 +464,7 @@ async def usage_summary(_: Principal = Depends(admin)):
               "reasoning_tokens": 0, "est_cost_usd": 0.0}
     by_model: dict[str, dict] = {}
     per_task = []
-    for t in app.state.store.all():
+    for t in await _all_tasks():
         u = t.usage or {}
         if not u.get("llm_calls"):
             continue
@@ -416,7 +489,7 @@ async def task_evidence(task_id: str, name: str, p: Principal = Depends(principa
     """Final-state screenshot captured by the browser executor (blueprint: evidence)."""
     from pathlib import Path
     from fastapi.responses import FileResponse
-    task = _own_task(p, task_id)
+    task = await _own_task(p, task_id)
     if name not in task.evidence:                    # only files recorded for THIS task
         raise HTTPException(404, "evidence not found")
     path = Path(__file__).resolve().parents[1] / "evidence" / Path(name).name
@@ -427,28 +500,31 @@ async def task_evidence(task_id: str, name: str, p: Principal = Depends(principa
 
 @app.get("/v1/tasks/{task_id}/approvals")
 async def task_approvals(task_id: str, p: Principal = Depends(principal)):
-    _own_task(p, task_id)
-    return [r.view() for r in app.state.controller.approvals_for(task_id)]
+    await _own_task(p, task_id)
+    return await _ctl(task_id, "approvals_for")
 
 
 @app.get("/v1/approvals/{approval_id}")
 async def get_approval(approval_id: str, p: Principal = Depends(principal)):
-    rec = app.state.controller.get_approval(approval_id)
-    if rec is None:
+    task_id = await _approval_task_id(approval_id)
+    if task_id is None:
         raise HTTPException(404, "approval not found")
-    _own_task(p, rec.task_id)
-    return rec.view()
+    await _own_task(p, task_id)
+    view = await _ctl(task_id, "get_approval", approval_id=approval_id)
+    if view is None:
+        raise HTTPException(404, "approval not found")
+    return view
 
 
 @app.post("/v1/approvals/{approval_id}/decision")
 async def decide_approval(approval_id: str, body: Approve, p: Principal = Depends(principal)):
     """Approve or reject one EXACT pending action (blueprint: transaction-bound approval)."""
-    rec = app.state.controller.get_approval(approval_id)
-    if rec is None:
+    task_id = await _approval_task_id(approval_id)
+    if task_id is None:
         raise HTTPException(404, "approval not found")
-    _own_task(p, rec.task_id)
-    ok, result = app.state.controller.decide_approval(approval_id, body.approved, body.note,
-                                                      approver=p.sub)
+    await _own_task(p, task_id)
+    ok, result = await _ctl(task_id, "decide_approval", approval_id=approval_id,
+                            approved=body.approved, note=body.note, approver=p.sub)
     if not ok:
         raise HTTPException(409, result)
     return {"approval_id": approval_id, "decision": result}
@@ -457,15 +533,15 @@ async def decide_approval(approval_id: str, body: Approve, p: Principal = Depend
 @app.post("/v1/tasks/{task_id}/answer")
 @app.post("/tasks/{task_id}/answer")
 async def answer(task_id: str, body: Answer, p: Principal = Depends(principal)):
-    _own_task(p, task_id)
-    return {"ok": app.state.controller.resolve_answer(task_id, body.facts)}
+    await _own_task(p, task_id)
+    return {"ok": await _ctl(task_id, "resolve_answer", facts=body.facts)}
 
 
 @app.post("/v1/tasks/{task_id}/cancel")
 @app.post("/tasks/{task_id}/cancel")
 async def cancel(task_id: str, p: Principal = Depends(principal)):
-    _own_task(p, task_id)
-    app.state.controller.cancel(task_id)
+    await _own_task(p, task_id)
+    await _ctl(task_id, "cancel")
     return {"ok": True}
 
 
@@ -473,10 +549,13 @@ async def cancel(task_id: str, p: Principal = Depends(principal)):
 async def stop_all(p: Principal = Depends(principal)):
     """Emergency stop: cancel every unfinished task this caller may control."""
     stopped = 0
-    for t in app.state.store.all():
+    for t in await _all_tasks():
         if t.state not in TERMINAL and _visible(p, t):
-            app.state.controller.cancel(t.id)
-            stopped += 1
+            try:
+                await _ctl(t.id, "cancel")
+                stopped += 1
+            except HTTPException:
+                pass                                  # its worker is gone (task is dead)
     return {"stopped": stopped}
 
 
@@ -513,6 +592,7 @@ async def ws_device(socket: WebSocket, device_id: str):
     await socket.accept()
     session = DeviceSession(device_id, socket)
     app.state.devices.add(session)
+    await app.state.cluster.device_up(session)     # tasks on other workers can reach it
     controller: AgentController = app.state.controller
     # Re-deliver any prompt a waiting task is blocked on (survives ws flaps).
     asyncio.create_task(controller.on_device_connected(session))
@@ -521,17 +601,21 @@ async def ws_device(socket: WebSocket, device_id: str):
             msg = await socket.receive_json()
             mtype = msg.get("type")
             if mtype in ("approval_response", "answer"):
-                task = app.state.store.get(msg.get("task_id", ""))
+                task = await _lookup(msg.get("task_id", ""))
                 # The owner may answer — and so may the device the task is RUNNING on: the
                 # server pushed the prompt to that screen, for the person sitting at it
                 # (e.g. an admin-started task on a desktop). Nobody else can.
                 if task is None or not (_visible(p, task) or task.device_id == p.sub):
                     continue                  # can't answer someone else's task
-                if mtype == "approval_response":
-                    controller.resolve_approval(task.id, bool(msg.get("approved")),
-                                                msg.get("note", ""), approver=p.sub)
-                else:
-                    controller.resolve_answer(task.id, msg.get("facts", {}))
+                try:                          # routed to the worker running the task
+                    if mtype == "approval_response":
+                        await _ctl(task.id, "resolve_approval",
+                                   approved=bool(msg.get("approved")),
+                                   note=msg.get("note", ""), approver=p.sub)
+                    else:
+                        await _ctl(task.id, "resolve_answer", facts=msg.get("facts", {}))
+                except HTTPException as e:
+                    log.warning("could not deliver %s for %s: %s", mtype, task.id, e.detail)
             else:
                 session.on_message(msg)   # correlate observe/act responses by rid
     except WebSocketDisconnect:
@@ -539,6 +623,7 @@ async def ws_device(socket: WebSocket, device_id: str):
     finally:
         session.fail_all(RuntimeError("device disconnected"))
         app.state.devices.remove(device_id, session)   # only if still the current one
+        await app.state.cluster.device_down(session)
 
 
 @app.websocket("/ws/events")
@@ -558,7 +643,7 @@ async def _stream_events(socket: WebSocket, task_id: str | None) -> None:
         await socket.close(code=1008)
         return
     if task_id is not None:
-        task = app.state.store.get(task_id)
+        task = await _lookup(task_id)
         if task is None or not _visible(p, task):
             await socket.close(code=1008)
             return
@@ -570,8 +655,10 @@ async def _stream_events(socket: WebSocket, task_id: str | None) -> None:
             if task_id is not None and event.get("task_id") != task_id:
                 continue
             if not p.is_admin:
+                # Events from other workers carry the owner (no local task object).
                 task = app.state.store.get(event.get("task_id", ""))
-                if task is None or not _visible(p, task):
+                owner = (task.owner or task.device_id) if task else event.get("owner", "")
+                if not (p.scope == "device" and owner and owner == p.sub):
                     continue
             await socket.send_json(event)
     except WebSocketDisconnect:

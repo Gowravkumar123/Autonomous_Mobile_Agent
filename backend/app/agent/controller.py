@@ -57,6 +57,8 @@ class AgentController:
         self.tools = None   # app.tools.ToolRegistry (built-in + MCP), set by the app
         from ..kv import MemoryKV
         self.kv = MemoryKV()   # shared short-lived state (Redis when configured)
+        from ..cluster import LocalCluster
+        self.cluster = LocalCluster()   # multi-worker routing (RedisCluster when configured)
         self._graph = None  # compiled lazily (imports langgraph on first run)
 
     async def on_device_connected(self, session: DeviceSession) -> None:
@@ -197,9 +199,11 @@ class AgentController:
         task.usage = obs.begin_task_usage()          # filled live by every LLM call
         with obs.span("task", **{"task.id": task.id, "task.owner": task.owner or "",
                                  "task.prompt_chars": len(task.prompt or "")}) as sp:
+            self.cluster.claim_task(task.id)          # peers route control calls here
             try:
                 await self._run_task_inner(task)
             finally:
+                self.cluster.release_task(task.id)
                 u = task.usage or {}
                 obs.set_attrs(sp, **{
                     "task.state": task.state.value, "task.executor": task.executor,
@@ -258,7 +262,7 @@ class AgentController:
         re.IGNORECASE)
 
     def _sessions_of(self, kind: str) -> list:
-        return [d for d in self.devices._sessions.values() if getattr(d, "kind", "") == kind]
+        return [d for d in self.devices.all() if getattr(d, "kind", "") == kind]
 
     def _phone_connected(self) -> bool:
         return bool(self._sessions_of("phone"))
@@ -734,6 +738,7 @@ class AgentController:
             reason=decision.reason, amount=payload.get("amount"),
             action_label=self._action_label(action), risk_level=decision.risk_level)
         self._approval_records[rec.approval_id] = rec
+        self.cluster.note_approval(rec.approval_id, task.id)
         payload.update(approval_id=rec.approval_id, expires_in=int(self.approval_ttl_s))
         task.pending_action = action
         task.pending_approval_reason = decision.reason
