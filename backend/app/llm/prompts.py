@@ -175,6 +175,8 @@ ACTION_SYSTEM = (
     "- NEVER type OTPs, PINs, passwords, card numbers or CVVs. If a screen asks for those, "
     "or is a payment/UPI screen, choose action type `approve` and hand control to the user.\n"
     "- If the goal looks complete (confirmation, booking reference, order placed), choose `done`.\n"
+    "  With `done`, put the RESULT FOR THE USER in `text` (e.g. the list of movies they asked "
+    "for, the booking reference), not only in `thought`.\n"
     "- Be decisive: when several options match the user's stated preferences, PICK the best "
     "one yourself (e.g. earliest departure, then lowest fare, with seats available) and act — "
     "do NOT ask the user to choose routine, reversible things. Reserve `ask_user` for a genuinely "

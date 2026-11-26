@@ -399,7 +399,8 @@ def build_react_graph(controller):
                                else "model reported done without a successful tool result")
                 return {"status": "done" if verified else "waiting"}
             verified = is_success(screen, skill, task)
-            answer = (action.text or "").strip()
+            # Live, the model put the movie list in `thought` and left `text` empty.
+            answer = (action.text or action.thought or "").strip()
             # The model's answer IS the result for information goals ("which movies are
             # showing?"). Live, it was dropped: the summary only restated the goal, so
             # neither the app nor the voice ever told the user the movie list.

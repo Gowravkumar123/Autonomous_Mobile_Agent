@@ -127,6 +127,18 @@ async def answer_in_summary() -> None:
     check(task.state in (TaskState.COMPLETED, TaskState.WAITING_FOR_USER),
           "read-only answer ends the task (no further steps)")
 
+    # Second live run: the model put the list in `thought` and left `text` empty.
+    async def decide_thought(task, skill, screen, feedback=""):
+        return AgentAction(type=ActionType.DONE, text=None,
+                           thought="The Now Showing screen lists: Gunmaaster G9, Bhogi.")
+    c._decide = decide_thought
+    t2 = Task(prompt="which movies?", device_id="p2", executor="mobile", goal="List movies",
+              skill="generic", plan=["read"])
+    c.store.create(t2)
+    await asyncio.wait_for(c._execute_phase(t2), 30)
+    check("Gunmaaster G9, Bhogi" in t2.summary,
+          "answer left in `thought` (text empty) still becomes the result")
+
 
 async def main() -> None:
     await scroll_fallback()

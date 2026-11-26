@@ -379,8 +379,11 @@ async def two_processes() -> None:
             r = await h.get(f"{B}/v1/tasks/{tid}", headers=adm)
             check(r.status_code == 200 and r.json()["state"] == "COMPLETED",
                   "after A dies, B still serves the finished task")
-            r = await h.post(f"{B}/v1/tasks/{tid}/cancel", headers=adm)
+            r = await h.post(f"{B}/v1/tasks/{tid}/pause", headers=adm)
             check(r.status_code == 503, "control call to a dead worker -> 503 (not a hang)")
+            r = await h.post(f"{B}/v1/tasks/{tid}/cancel", headers=adm)
+            check(r.status_code == 200 and "not running" in r.json().get("note", ""),
+                  "cancel of a task whose worker died -> ok (it isn't running anywhere)")
     finally:
         stop.set()
         if phone_task is not None:

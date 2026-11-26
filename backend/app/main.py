@@ -560,7 +560,15 @@ async def answer(task_id: str, body: Answer, p: Principal = Depends(principal)):
 @app.post("/tasks/{task_id}/cancel")
 async def cancel(task_id: str, p: Principal = Depends(principal)):
     await _own_task(p, task_id)
-    await _ctl(task_id, "cancel")
+    try:
+        await _ctl(task_id, "cancel")
+    except HTTPException as e:
+        # Its worker died (e.g. a redeploy): the task isn't running anywhere, which is
+        # what the caller wants. Live, this returned 503 for a pre-deploy task.
+        cl = app.state.cluster
+        if e.status_code == 503 and cl.enabled and not await cl.task_alive(task_id):
+            return {"ok": True, "note": "the task's worker is gone; it is not running"}
+        raise
     return {"ok": True}
 
 
