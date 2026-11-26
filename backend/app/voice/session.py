@@ -48,6 +48,14 @@ _NAMES = r"zoro|zorro|zoroo|zoru|juro|jurro|joro|jorro|jiro|jiroh|ziro|soro|sorr
 NAME_LEAD = re.compile(rf"^\W*(?:(?:hey|hi|hello|ok|okay|yo|oh)\W+)?(?:{_NAMES})\b[\s,.!?:;-]*",
                        re.I)
 NAME_TAIL = re.compile(rf"[\s,]+(?:{_NAMES})\W*$", re.I)
+# Leading "word," that may be a mishearing of the name (checked fuzzily, see _sounds_like_name).
+LEAD_WORD = re.compile(r"^\W*(?:(?:hey|hi|hello|ok|okay|yo|oh)\W+)?([a-z]{3,7})\b[\s,.!?:;-]*", re.I)
+_NAME_FORMS = ("zoro", "juro", "jiro", "zorro")
+# Real words that sound close to "Zoro" but are not the name.
+_NOT_NAME = {"zero", "euro", "euros", "hero", "heroes", "pro", "sorry", "sure", "sir", "door",
+             "floor", "four", "your", "yours", "tour", "turn", "zoom", "room", "torro", "giro",
+             "jury", "zone", "sorrow", "borrow", "tomorrow", "story", "guru", "who", "hello",
+             "hurry", "worry", "car", "jar", "zara", "sara", "laura", "juro"}
 # Does an un-named utterance look like a request to an assistant (vs. people chatting)?
 REQUEST = re.compile(
     r"\b(book|order|search|find|open|send|call|message|text|play|show|tell|check|buy|get|"
@@ -125,6 +133,7 @@ class VoiceSession:
         self._recent_spoken: deque = deque(maxlen=6)   # echo filter
         self._start_overlapped = False
         self._attention_until = 0.0
+        self._explicit_until = 0.0       # just tapped Talk / said "Hey Zoro": all speech is for us
         self._last_partial = 0.0
         self._workers: list[asyncio.Task] = []
         self._events_q: asyncio.Queue | None = None
@@ -137,6 +146,7 @@ class VoiceSession:
         """(Re)connect a transport; the conversation (task, pending prompt) carries on."""
         self.transport = transport
         self._open_attention(self.cfg.attention_on_connect_s)
+        self._explicit_until = time.monotonic() + self.cfg.attention_on_connect_s
         await self._send({"type": "ready", "session_id": self.id, "mode": self.cfg.mode,
                           "task_id": self.task_id, "pending": self.pending.kind,
                           "format": {"encoding": "pcm16le", "rate": 16000, "channels": 1,
@@ -313,7 +323,8 @@ class VoiceSession:
         self._attention_until = max(self._attention_until, time.monotonic() + seconds)
 
     def attention_open(self) -> bool:
-        return time.monotonic() < self._attention_until or self.pending.kind != ""
+        return (time.monotonic() < max(self._attention_until, self._explicit_until)
+                or self.pending.kind != "")
 
     async def _route(self, text: str, conf: float, source: str, speech_ms: int = 0,
                      overlapped: bool = False, addressed: bool = False) -> tuple[str, str]:
@@ -334,8 +345,10 @@ class VoiceSession:
             if named and len(text.split()) < 2 and not (YES.match(text) or NO.match(text) or
                                                          STOP.match(text) or STATUS.search(text)):
                 self._open_attention(self.cfg.attention_after_reply_s + 4)
+                self._explicit_until = time.monotonic() + self.cfg.attention_after_reply_s + 4
                 return ("Yes? What would you like me to do?", "wake")
-        explicit = source != "voice" or addressed or named
+        explicit = (source != "voice" or addressed or named
+                    or time.monotonic() < self._explicit_until)
         task = await self.b.lookup(self.task_id) if self.task_id else None
         state = task.state.value if task is not None else ""
         active = task is not None and state not in TERMINAL
@@ -566,9 +579,24 @@ def _chunks(text: str, limit: int = 180) -> list[str]:
     return out or [text]
 
 
+def _sounds_like_name(word: str) -> bool:
+    import difflib
+    w = word.lower()
+    if w in _NOT_NAME:
+        return False
+    return max(difflib.SequenceMatcher(None, w, f).ratio() for f in _NAME_FORMS) >= 0.6 \
+        and w[-1] in "ou"
+
+
 def _strip_name(text: str) -> tuple[str, bool]:
     """Remove a leading/trailing "Zoro" (any of its mishearings); report if it was there."""
     t = NAME_LEAD.sub("", text, count=1)
+    if t == text:
+        m = LEAD_WORD.match(text)
+        # Only a word set off like a name ("Churro, ...") — not the start of a sentence.
+        if m and _sounds_like_name(m.group(1)) and re.match(
+                r"^\W*(?:(?:hey|hi|hello|ok|okay|yo|oh)\W+)?[a-z]+\s*[,.!?:;-]", text, re.I):
+            t = text[m.end():]
     named = t != text
     t2 = NAME_TAIL.sub("", t)
     named = named or t2 != t

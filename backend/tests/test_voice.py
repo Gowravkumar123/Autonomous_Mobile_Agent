@@ -354,6 +354,23 @@ async def addressing_regression() -> None:
     s._attention_until = 0.0
     _, intent = await s._route("set the timer to zero for the next round", 0.8, "voice", 1800)
     check(intent == "ignored_unaddressed", "'zero' in normal speech is not the name")
+    # Fourth live session (on the server): heard as "Churro", and "search" as "such".
+    s._attention_until, s._explicit_until, s.pending = 0.0, 0.0, Pending()
+    reply, intent = await s._route("Churro, such for capital of Australia.", 0.50, "voice", 2820)
+    check(intent == "confirm_task" and "Such for capital of Australia" in reply,
+          "'Churro, ...' is the name (fuzzy) -> low-confidence request read back, not dropped")
+    s.pending = Pending()
+    for txt in ("Zero is my favourite number, honestly.", "Hello, how are you doing today?",
+                "Euro, dollar and pound prices today", "Sorry, I was talking to my friend"):
+        s._attention_until, s._explicit_until = 0.0, 0.0
+        _, intent = await s._route(txt, 0.8, "voice", 1500)
+        check(intent == "ignored_unaddressed", f"not the name: {txt!r}")
+    s._attention_until = 0.0
+    s._explicit_until = time.monotonic() + 10            # user just tapped Talk
+    _, intent = await s._route("such for capital of Australia", 0.7, "voice", 2000)
+    check(intent == "new_task", "right after tapping Talk, any clear request counts (no name)")
+    task["t"], s.task_id = None, ""
+    s._explicit_until = 0.0
     reply, intent = await s._route("Hey Zoro", 0.8, "voice", 700)
     check(intent == "wake" and s.attention_open(), "'Hey Zoro' alone -> 'Yes?' and listens")
     _, intent = await s._route("search the weather in Hyderabad", 0.8, "voice", 1600)
