@@ -24,6 +24,7 @@ import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import com.quantumleap.agent.BuildConfig
 import com.quantumleap.agent.net.Auth.withAuth
+import com.quantumleap.agent.net.VoiceConversation
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
@@ -54,9 +55,21 @@ class AgentForegroundService : Service() {
     private var ttsReady = false
     private var recognizer: SpeechRecognizer? = null
     private var player: android.media.MediaPlayer? = null
+    private var status = ""
 
     private var porcupine: PorcupineManager? = null
     @Volatile private var wakeWanted = false
+
+    // Full-duplex conversation with the backend voice gateway (server VAD + barge-in).
+    private var conversation: VoiceConversation? = null
+    @Volatile private var lastActivity = 0L
+    private val idleCheck = object : Runnable {
+        override fun run() {
+            if (conversation == null) return
+            if (System.currentTimeMillis() - lastActivity > CONVERSATION_IDLE_MS) endConversation()
+            else main.postDelayed(this, 5000)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -72,10 +85,18 @@ class AgentForegroundService : Service() {
             ACTION_WAKE_OFF -> { wakeWanted = false; stopWake() }
             ACTION_LISTEN -> { pauseWake(); speakThen("Listening") { listenCommand(0) } }
             ACTION_STOP -> stopTasks()
-            ACTION_ASK -> { pauseWake(); handleQuestion(intent.getStringExtra(EXTRA_PROMPT) ?: "I need more information.") { a ->
+            ACTION_CONVERSE -> if (conversation == null) startConversation() else endConversation()
+            // While a conversation is live the server's voice session narrates questions and
+            // approvals itself, so they aren't spoken twice.
+            ACTION_ASK -> if (conversation == null) { pauseWake(); handleQuestion(intent.getStringExtra(EXTRA_PROMPT) ?: "I need more information.") { a ->
                 AgentAccessibilityService.instance?.answerClarification(a)
             } }
-            ACTION_APPROVE -> { pauseWake(); handleQuestion(
+            ACTION_APPROVE -> if (conversation != null) Unit
+            else if (intent.getIntExtra(EXTRA_RISK, 0) >= 4) {
+                // Blueprint: a spoken yes is never enough for payment / sign-in.
+                speak((intent.getStringExtra(EXTRA_PROMPT) ?: "Payment step") +
+                    ". Please confirm it on the approval screen in the app.")
+            } else { pauseWake(); handleQuestion(
                 (intent.getStringExtra(EXTRA_PROMPT) ?: "Approval needed.") +
                     ". Say approve to continue, or decline.") { a ->
                 val l = a.lowercase()
@@ -91,7 +112,62 @@ class AgentForegroundService : Service() {
         return START_STICKY
     }
 
-    override fun onDestroy() { stopWake(); destroyRecognizer(); releasePlayer(); tts?.shutdown(); super.onDestroy() }
+    override fun onDestroy() {
+        conversation?.stop(); conversation = null
+        stopWake(); destroyRecognizer(); releasePlayer(); tts?.shutdown(); super.onDestroy()
+    }
+
+    // ---------------- full-duplex conversation ---------------- //
+    private fun sessionId(): String {
+        val prefs = getSharedPreferences("agent", Context.MODE_PRIVATE)
+        return prefs.getString("voice_sid", null) ?: ("zoro-" + java.util.UUID.randomUUID()
+            .toString().take(12)).also { prefs.edit().putString("voice_sid", it).apply() }
+    }
+
+    private fun startConversation() {
+        pauseWake()                 // Porcupine and the conversation can't share the mic
+        destroyRecognizer()
+        lastActivity = System.currentTimeMillis()
+        val conv = VoiceConversation(this, sessionId(), object : VoiceConversation.Listener {
+            override fun onState(state: String) {
+                main.post {
+                    Log.i(TAG, "conversation: $state")
+                    if (state == "live") status = "Listening - just talk (interrupt any time)"
+                    if (state.startsWith("error")) status = "Voice: " + state.removePrefix("error:")
+                    if (state == "closed" || state.startsWith("error")) {
+                        main.removeCallbacks(idleCheck)
+                        conversation = null
+                        resumeWake()
+                    }
+                    updateNotification(listening = porcupine != null)
+                }
+            }
+            override fun onTranscript(text: String, final: Boolean) {
+                if (final) main.post { status = "You: $text"; updateNotification(false) }
+            }
+            override fun onAgentText(text: String) {
+                main.post { status = "Zoro: $text"; updateNotification(false) }
+            }
+            override fun onSay(text: String, done: () -> Unit) {
+                main.post { androidSpeakThen(text, done) }
+            }
+            override fun onActivity() { lastActivity = System.currentTimeMillis() }
+        })
+        conversation = conv
+        conv.start("duplex")
+        main.postDelayed(idleCheck, 5000)
+        updateNotification(false)
+    }
+
+    private fun endConversation() {
+        main.removeCallbacks(idleCheck)
+        val c = conversation
+        conversation = null
+        c?.stop()
+        status = ""
+        updateNotification(false)
+        resumeWake()
+    }
 
     // ---------------- wake word (Porcupine) ---------------- //
     private fun accessKey(): String =
@@ -138,7 +214,8 @@ class AgentForegroundService : Service() {
 
     private fun onWakeDetected() {
         pauseWake()
-        speakThen("Yes?") { listenCommand(0) }
+        // The wake word opens a hands-free conversation (it ends itself when idle).
+        startConversation()
     }
 
     // ---------------- voice flows ---------------- //
@@ -293,15 +370,25 @@ class AgentForegroundService : Service() {
         val listenPI = PendingIntent.getService(
             this, 1, Intent(this, AgentForegroundService::class.java).setAction(ACTION_LISTEN),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val talkPI = PendingIntent.getService(
+            this, 3, Intent(this, AgentForegroundService::class.java).setAction(ACTION_CONVERSE),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val stopPI = PendingIntent.getService(
             this, 2, Intent(this, AgentForegroundService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return Notification.Builder(this, channelId)
             .setContentTitle("OnePiece")
-            .setContentText(if (listening) "Wake word on — say the word, or tap Speak"
-                            else "Tap Speak to give a voice command")
+            .setContentText(when {
+                status.isNotBlank() -> status
+                conversation != null -> "Conversation on - just talk"
+                listening -> "Wake word on - say the word, or tap Talk"
+                else -> "Tap Talk for a conversation, or Speak for one command"
+            })
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
+            .addAction(Notification.Action.Builder(
+                android.R.drawable.ic_btn_speak_now,
+                if (conversation != null) "🔇 End talk" else "💬 Talk", talkPI).build())
             .addAction(Notification.Action.Builder(
                 android.R.drawable.ic_btn_speak_now, "🎤 Speak", listenPI).build())
             .addAction(Notification.Action.Builder(
@@ -327,19 +414,25 @@ class AgentForegroundService : Service() {
         const val ACTION_STOP = "com.quantumleap.agent.STOP"
         const val ACTION_WAKE_ON = "com.quantumleap.agent.WAKE_ON"
         const val ACTION_WAKE_OFF = "com.quantumleap.agent.WAKE_OFF"
+        const val ACTION_CONVERSE = "com.quantumleap.agent.CONVERSE"
         const val EXTRA_PROMPT = "prompt"
+        const val EXTRA_RISK = "risk"
+        private const val CONVERSATION_IDLE_MS = 45_000L
 
         fun keepAlive(ctx: Context) = start(ctx, null, null)
         fun askUser(ctx: Context, q: String) = start(ctx, ACTION_ASK, q)
-        fun requestApproval(ctx: Context, s: String) = start(ctx, ACTION_APPROVE, s)
+        fun requestApproval(ctx: Context, s: String, risk: Int = 0) =
+            start(ctx, ACTION_APPROVE, s, risk)
+        fun converse(ctx: Context) = start(ctx, ACTION_CONVERSE, null)
         fun listen(ctx: Context) = start(ctx, ACTION_LISTEN, null)
         fun wakeOn(ctx: Context) = start(ctx, ACTION_WAKE_ON, null)
         fun wakeOff(ctx: Context) = start(ctx, ACTION_WAKE_OFF, null)
 
-        private fun start(ctx: Context, action: String?, prompt: String?) {
+        private fun start(ctx: Context, action: String?, prompt: String?, risk: Int = 0) {
             val i = Intent(ctx, AgentForegroundService::class.java).apply {
                 this.action = action
                 if (prompt != null) putExtra(EXTRA_PROMPT, prompt)
+                putExtra(EXTRA_RISK, risk)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
             else ctx.startService(i)

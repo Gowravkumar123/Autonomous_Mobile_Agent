@@ -843,6 +843,7 @@ class AgentController:
         return ApprovalRequest(
             task_id=task.id, step_id=task.step_id, title=title,
             summary=f"{task.goal}", amount=amount, reason=decision.reason,
+            risk_level=decision.risk_level,
         ).model_dump(mode="json")
 
     def _action_label(self, action: AgentAction) -> str:

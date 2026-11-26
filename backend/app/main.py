@@ -110,10 +110,15 @@ async def lifespan(app: FastAPI):
     _ = app.state.controller.graph
     await app.state.cluster.start(app.state)
 
+    # Voice gateway: sessions drive the SAME task runtime as text (blueprint 4).
+    from .voice.manager import VoiceManager
+    app.state.voice = VoiceManager(_voice_backend, db=app.state.db)
+
     log.info("Agent backend ready. LLM: %s | DB: %s | auth: %s", app.state.llm.active,
              "postgres" if app.state.db else "in-memory",
              "on" if app.state.auth.enabled else "OFF")
     yield
+    await app.state.voice.close_all()
     await app.state.cluster.stop()   # withdraw this worker's devices from the directory
     await app.state.tools.stop()     # stop MCP server processes / sessions
     await app.state.kv.close()
@@ -399,11 +404,20 @@ async def create_task(body: CreateTask, p: Principal = Depends(principal)):
         raise HTTPException(422, "executor must be auto, mobile, browser, api or desktop")
     if body.start_url and not body.start_url.startswith(("http://", "https://")):
         raise HTTPException(422, "start_url must be an http(s) URL")
-    task = Task(prompt=body.prompt, device_id=device_id, owner=p.sub,
-                executor="" if executor == "auto" else executor, start_url=body.start_url)
+    task = _start_task(body.prompt, owner=p.sub, device_id=device_id,
+                       executor="" if executor == "auto" else executor,
+                       start_url=body.start_url)
+    return {"task_id": task.id, "state": task.state.value}
+
+
+def _start_task(prompt: str, *, owner: str, device_id: str = "", executor: str = "",
+                start_url: str = "") -> Task:
+    """The one way tasks start — REST and voice alike."""
+    task = Task(prompt=prompt, device_id=device_id, owner=owner, executor=executor,
+                start_url=start_url)
     app.state.store.create(task)
     asyncio.create_task(app.state.controller.run_task(task))
-    return {"task_id": task.id, "state": task.state.value}
+    return task
 
 
 @app.get("/v1/tasks")
@@ -578,6 +592,155 @@ async def voice_stt(file: UploadFile = File(...), _: Principal = Depends(princip
     from .voice.groq_audio import stt
     text = await stt(await file.read(), file.filename or "audio.wav")
     return {"text": text}
+
+
+# --------------------------------------------------------------------------- #
+# Voice gateway (blueprint 4 + 9): WS /v1/voice/{session_id} carries 20 ms PCM16 frames
+# (binary) both ways plus JSON control/events; WebRTC is the alternative media path.
+# --------------------------------------------------------------------------- #
+import re as _re                                                    # noqa: E402
+
+_SESSION_ID = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _voice_backend(owner: str, device_id: str):
+    from .voice.groq_audio import stt_detailed, tts_cached
+    from .voice.session import Backend
+    s = app.state.settings
+
+    async def create(prompt: str) -> str:
+        return _start_task(prompt, owner=owner, device_id=device_id).id
+
+    async def stt(wav: bytes):
+        return await stt_detailed(wav, "turn.wav", s.voice_language)
+
+    return Backend(create_task=create, lookup=_lookup, ctl=_ctl,
+                   subscribe=app.state.store.subscribe,
+                   unsubscribe=app.state.store.unsubscribe,
+                   stt=stt, tts=tts_cached,
+                   record_turn=lambda t: app.state.voice.record_turn(t))
+
+
+def _voice_cfg(mode: str):
+    from .voice.session import VoiceConfig
+    s = app.state.settings
+    return VoiceConfig(mode=mode if mode in ("duplex", "ptt") else "duplex",
+                       end_silence_ms=s.voice_end_silence_ms,
+                       min_confidence=s.voice_min_confidence,
+                       progress_every_s=s.voice_progress_s,
+                       partial_every_s=s.voice_partial_s, language=s.voice_language)
+
+
+def _voice_device(p: Principal, requested: str) -> str:
+    # A device's voice session drives that device; an admin may name one.
+    return p.sub if p.scope == "device" else (requested or "")
+
+
+class _WsVoiceTransport:
+    def __init__(self, socket: WebSocket):
+        self.socket = socket
+        self._lock = asyncio.Lock()
+
+    async def send_json(self, msg: dict) -> None:
+        async with self._lock:
+            await self.socket.send_json(msg)
+
+    async def send_audio(self, frame: bytes) -> None:
+        async with self._lock:
+            await self.socket.send_bytes(frame)
+
+
+@app.websocket("/v1/voice/{session_id}")
+async def ws_voice(socket: WebSocket, session_id: str):
+    p = ws_principal(socket)
+    if p is None or not _SESSION_ID.match(session_id):
+        await socket.close(code=1008)
+        return
+    q = socket.query_params
+    sess = await app.state.voice.get_or_create(
+        session_id, p.sub, _voice_device(p, q.get("device_id", "")),
+        _voice_cfg(q.get("mode", "duplex")))
+    if sess is None:                         # someone else's conversation
+        await socket.close(code=1008)
+        return
+    await socket.accept()
+    transport = _WsVoiceTransport(socket)
+    await sess.attach(transport)
+    try:
+        while True:
+            msg = await socket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            if msg.get("bytes"):
+                await sess.feed_audio(msg["bytes"])
+            elif msg.get("text"):
+                try:
+                    import json as _json
+                    await sess.handle_json(_json.loads(msg["text"]))
+                except ValueError:
+                    pass
+    except WebSocketDisconnect:
+        pass
+    finally:
+        sess.detach(transport)
+        app.state.voice.touch(session_id)
+
+
+class VoiceTurn(BaseModel):
+    text: str
+    device_id: str = ""
+
+
+@app.post("/v1/voice/{session_id}/turns")
+async def voice_turn(session_id: str, body: VoiceTurn, p: Principal = Depends(principal)):
+    """Submit a finalized transcript or a typed fallback turn (same task state)."""
+    if not _SESSION_ID.match(session_id):
+        raise HTTPException(422, "bad session id")
+    sess = await app.state.voice.get_or_create(session_id, p.sub,
+                                               _voice_device(p, body.device_id))
+    if sess is None:
+        raise HTTPException(404, "session not found")
+    reply = await sess.submit_text(body.text[:2000])
+    return {"session_id": session_id, "reply": reply, "task_id": sess.task_id,
+            "pending": sess.pending.kind}
+
+
+class WebRtcOffer(BaseModel):
+    sdp: str
+    type: str = "offer"
+    mode: str = "duplex"
+    device_id: str = ""
+
+
+@app.post("/v1/voice/{session_id}/webrtc")
+async def voice_webrtc(session_id: str, body: WebRtcOffer, p: Principal = Depends(principal)):
+    """WebRTC signaling: SDP offer in, answer out. Audio = Opus/SRTP; JSON control and
+    events on the "control" data channel."""
+    from .voice import webrtc
+    if not webrtc.available():
+        raise HTTPException(501, "WebRTC unavailable on this server (pip install aiortc)")
+    if not _SESSION_ID.match(session_id):
+        raise HTTPException(422, "bad session id")
+    sess = await app.state.voice.get_or_create(session_id, p.sub,
+                                               _voice_device(p, body.device_id),
+                                               _voice_cfg(body.mode))
+    if sess is None:
+        raise HTTPException(404, "session not found")
+    ice = [u.strip() for u in app.state.settings.voice_ice_servers.split(",") if u.strip()]
+    transport = webrtc.WebRtcTransport(sess, ice)
+    answer = await transport.answer(body.sdp, body.type)
+    await sess.attach(transport)
+    return answer
+
+
+@app.get("/v1/voice/{session_id}")
+async def voice_info(session_id: str, p: Principal = Depends(principal)):
+    sess = app.state.voice.sessions.get(session_id)
+    if sess is None or (sess.owner != p.sub and not p.is_admin):
+        raise HTTPException(404, "session not found")
+    return {"session_id": session_id, "owner": sess.owner, "mode": sess.cfg.mode,
+            "connected": sess.transport is not None, "task_id": sess.task_id,
+            "pending": sess.pending.kind, "turns": sess.turns[-50:]}
 
 
 # --------------------------------------------------------------------------- #

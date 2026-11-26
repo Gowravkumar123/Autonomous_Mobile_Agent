@@ -40,8 +40,8 @@ class Settings(BaseSettings):
     max_elements_in_prompt: int = 55
     history_in_prompt: int = 6
     # Groq voice models for the assistant (same GROQ_API_KEY).
-    groq_tts_model: str = "playai-tts"
-    groq_tts_voice: str = "Fritz-PlayAI"
+    groq_tts_model: str = "canopylabs/orpheus-v1-english"   # playai-tts was decommissioned
+    groq_tts_voice: str = "troy"        # orpheus: autumn diana hannah austin daniel troy
     groq_stt_model: str = "whisper-large-v3"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
@@ -69,6 +69,14 @@ class Settings(BaseSettings):
     # Multi-worker routing over Redis (device sockets, task control, events). On whenever
     # REDIS_URL is set; CLUSTER_ENABLED=false keeps each worker standalone.
     cluster_enabled: bool = True
+
+    # ---- Voice gateway (WS /v1/voice/{session}, WebRTC) ----
+    voice_end_silence_ms: int = 700      # end-of-turn silence (VAD endpointing)
+    voice_min_confidence: float = 0.35   # below this, ask the user to repeat
+    voice_progress_s: float = 20.0       # spoken progress updates while a task works
+    voice_partial_s: float = 0.0         # interim transcripts every N s (extra STT cost)
+    voice_language: str = ""             # e.g. "en"; "" = auto-detect
+    voice_ice_servers: str = "stun:stun.l.google.com:19302"   # WebRTC (comma-separated)
 
     # Authentication. HMAC key for the signed admin/device tokens. EMPTY = auth DISABLED
     # (every endpoint open — only acceptable on a private network). Generate one with

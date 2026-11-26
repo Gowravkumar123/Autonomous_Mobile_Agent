@@ -144,8 +144,18 @@ class MainActivity : AppCompatActivity() {
         root.addView(TextView(this).apply {
             text = "3 · Voice"; textSize = 18f; setPadding(0, 24, 0, 4)
         })
+        root.addView(Button(this).apply {
+            text = "💬 Talk with Zoro (hands-free conversation)"
+            setOnClickListener {
+                if (!hasMic()) { ensureMicPermission(); return@setOnClickListener }
+                AgentForegroundService.converse(this@MainActivity)
+                toast("Conversation on — just talk; interrupt any time. Tap again to end.")
+            }
+        })
         root.addView(TextView(this).apply {
-            text = "Push-to-talk: tap 🎤 Speak above (or the notification's Speak). " +
+            text = "Conversation: talk naturally; Zoro answers out loud and you can interrupt it. " +
+                   "Payments are never approved by voice — confirm them on screen. " +
+                   "Push-to-talk: tap 🎤 Speak above (or the notification's Speak). " +
                    "Hands-free wake word (\"Jarvis\", or \"Hey Zoro\" if a custom keyword is " +
                    "bundled) needs a free Picovoice AccessKey from console.picovoice.ai:"
             setPadding(0, 0, 0, 8)

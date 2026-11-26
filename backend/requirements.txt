@@ -44,3 +44,8 @@ redis
 # Observability: OpenTelemetry tracing (built-in timeline; export to Langfuse / any OTLP backend)
 opentelemetry-sdk
 opentelemetry-exporter-otlp-proto-http
+
+# Voice gateway: WebRTC media transport (optional — the WebSocket audio transport needs
+# nothing extra). Pulls PyAV; works on Linux servers (some locked-down Windows boxes block
+# PyAV's DLLs, in which case /v1/voice/{id}/webrtc returns 501).
+aiortc

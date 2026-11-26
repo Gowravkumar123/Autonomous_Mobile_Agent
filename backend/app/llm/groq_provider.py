@@ -11,6 +11,33 @@ from .base import LLMError, LLMProvider
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
+NO_NATIVE_TOOLS = ("\n\nIMPORTANT: Do NOT use native function/tool calling. Reply with the "
+                   "JSON object described above as plain message content only.")
+
+
+def _salvage_tool_call(error_text: str, system: str) -> str | None:
+    """Turn Groq's rejected native call (`failed_generation`) into our call_tool action —
+    only for action decisions, whose output format has a call_tool action."""
+    import json
+    if "call_tool" not in system:
+        return None
+    try:
+        gen = json.loads(error_text)["error"]["failed_generation"]
+        call = json.loads(gen) if isinstance(gen, str) else gen
+        if isinstance(call, list):
+            call = call[0]
+        name = call.get("name")
+        args = call.get("arguments") or call.get("parameters") or {}
+        if isinstance(args, str):
+            args = json.loads(args)
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+        return None
+    if not name or not isinstance(args, dict):
+        return None
+    return json.dumps({"type": "call_tool", "tool": name, "args": args,
+                       "thought": f"Call {name} (recovered from a native tool call).",
+                       "expectation": "the tool returns a result"})
+
 
 class GroqProvider(LLMProvider):
     name = "groq"
@@ -92,6 +119,23 @@ class GroqProvider(LLMProvider):
                             GROQ_URL, headers=headers,
                             json=self._payload(system, user, temperature, max_tokens, False,
                                                image_b64))
+                    # gpt-oss sometimes answers with a NATIVE function call when the prompt
+                    # lists tools; Groq rejects it (tool_use_failed). Retry once telling it
+                    # not to; if it insists and this is an action decision, salvage the
+                    # attempted call as our own call_tool action (same meaning).
+                    if r.status_code == 400 and "tool_use_failed" in r.text:
+                        obs.set_attrs(sp, **{"llm.retry.tool_use": True})
+                        failed = r
+                        r = await client.post(
+                            GROQ_URL, headers=headers,
+                            json=self._payload(system + NO_NATIVE_TOOLS, user, temperature,
+                                               max_tokens, json_mode, image_b64))
+                        if r.status_code == 400 and "tool_use_failed" in r.text:
+                            salvaged = _salvage_tool_call(r.text, system) or \
+                                _salvage_tool_call(failed.text, system)
+                            if salvaged is not None:
+                                obs.set_attrs(sp, **{"llm.salvaged_tool_call": True})
+                                return salvaged
                     r.raise_for_status()
                     data = r.json()
                     account(data)

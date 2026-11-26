@@ -171,7 +171,7 @@ class AgentAccessibilityService : AccessibilityService(), AgentWebSocketClient.H
         lastStatus = "Approval needed: ${request.optString("reason")}"
         // Ask by voice in the background — the UI is NOT brought to the front.
         val spoken = request.optString("title") + ". " + request.optString("summary")
-        AgentForegroundService.requestApproval(this, spoken)
+        AgentForegroundService.requestApproval(this, spoken, request.optInt("risk_level", 0))
     }
 
     override fun onAskUser(request: JSONObject) {

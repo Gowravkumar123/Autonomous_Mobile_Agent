@@ -99,6 +99,23 @@ SCHEMA = [
         revoked     boolean NOT NULL DEFAULT false
     )
     """,
+    # Voice turn METADATA (blueprint 8): transcript + timing, never raw audio.
+    """
+    CREATE TABLE IF NOT EXISTS voice_turns (
+        turn_id     text PRIMARY KEY,
+        session_id  text NOT NULL,
+        owner       text NOT NULL,
+        source      text NOT NULL,
+        transcript  text NOT NULL,
+        confidence  real,
+        speech_ms   integer,
+        stt_ms      integer,
+        intent      text NOT NULL,
+        task_id     text,
+        created_at  timestamptz NOT NULL DEFAULT now()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS voice_turns_session ON voice_turns (session_id, created_at)",
 ]
 
 # Multi-row statements: on a high-latency link (dev box -> Neon us-east-1 ~1s/statement)
@@ -119,6 +136,9 @@ _AUDIT_HEAD = "INSERT INTO audit_events (task_id, actor, action, detail, data) V
 _TOOLRUN_ROW = "(%s, %s, %s, %s, %s, %s, %s)"
 _TOOLRUN_HEAD = ("INSERT INTO tool_runs (task_id, step_id, tool_name, inputs_hash, ok, result, "
                  "elapsed_s) VALUES ")
+_VOICE_ROW = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+_VOICE_HEAD = ("INSERT INTO voice_turns (turn_id, session_id, owner, source, transcript, "
+               "confidence, speech_ms, stt_ms, intent, task_id) VALUES ")
 _CHUNK = 400   # rows per statement (stays far below Postgres' 65535-parameter limit)
 
 
@@ -156,6 +176,7 @@ class Database:
         self._dirty: dict[str, dict] = {}      # task_id -> latest snapshot
         self._audit: list[tuple] = []           # pending audit rows
         self._tool_runs: list[tuple] = []       # pending tool_runs rows
+        self._voice: list[tuple] = []           # pending voice_turns rows
         self._flush_scheduled = False
 
     # ------------------------------------------------------------------ #
@@ -236,6 +257,14 @@ class Database:
                                 float(elapsed_s)))
         self._schedule_flush()
 
+    def enqueue_voice_turn(self, t: dict) -> None:
+        if not self.ok:
+            return
+        self._voice.append((t["turn_id"], t["session_id"], t["owner"], t["source"],
+                            t["transcript"], t.get("confidence"), t.get("speech_ms"),
+                            t.get("stt_ms"), t["intent"], t.get("task_id") or None))
+        self._schedule_flush()
+
     def _schedule_flush(self) -> None:
         if self._flush_scheduled:
             return
@@ -253,7 +282,8 @@ class Database:
         self._dirty.clear()
         audits, self._audit = self._audit, []
         runs, self._tool_runs = self._tool_runs, []
-        if not tasks and not audits and not runs:
+        voice, self._voice = self._voice, []
+        if not tasks and not audits and not runs and not voice:
             return
 
         def work(conn):
@@ -264,6 +294,9 @@ class Database:
             for sql, params in _multi(_AUDIT_HEAD, _AUDIT_ROW, audits):
                 cur.execute(sql, params)
             for sql, params in _multi(_TOOLRUN_HEAD, _TOOLRUN_ROW, runs):
+                cur.execute(sql, params)
+            for sql, params in _multi(_VOICE_HEAD, _VOICE_ROW, voice,
+                                      " ON CONFLICT (turn_id) DO NOTHING"):
                 cur.execute(sql, params)
             conn.commit()
         try:

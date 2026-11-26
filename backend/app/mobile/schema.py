@@ -159,6 +159,7 @@ class ApprovalRequest(BaseModel):
     summary: str
     amount: Optional[float] = None
     reason: str = ""
+    risk_level: int = 0     # 4 = payment/auth: never approvable by voice alone
 
 
 class ApprovalResponse(BaseModel):
