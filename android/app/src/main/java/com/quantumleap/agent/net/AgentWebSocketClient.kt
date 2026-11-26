@@ -142,21 +142,42 @@ class AgentWebSocketClient(
         })
     }
 
+    /**
+     * Device work (observe / act / handoff) runs on its OWN thread, one request at a time,
+     * never on OkHttp's reader thread. Live on a POCO, a long observe of BookMyShow blocked
+     * the reader thread: pings went unanswered, the server dropped the phone, and it
+     * couldn't reconnect until the handler returned.
+     */
+    private val work = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "agent-device-work").apply { isDaemon = true }
+    }
+
     private fun dispatch(ws: WebSocket, msg: JSONObject) {
         val type = msg.optString("type")
         val rid = if (msg.has("rid")) msg.optInt("rid") else null
-        try {
-            when (type) {
-                "observe" -> reply(ws, rid, JSONObject().put("screen", handler.onObserve()))
-                "act" -> reply(ws, rid, handler.onAct(msg.optJSONObject("action") ?: JSONObject()))
-                "handoff" -> reply(ws, rid, handler.onHandoff(msg.optJSONObject("approval") ?: JSONObject()))
-                "approval_request" -> handler.onApprovalRequest(msg)
-                "ask_user" -> handler.onAskUser(msg)
-                else -> handler.onStatus(msg)
+        when (type) {
+            "observe", "act", "handoff" -> work.execute {
+                try {
+                    val payload = when (type) {
+                        "observe" -> JSONObject().put("screen", handler.onObserve())
+                        "act" -> handler.onAct(msg.optJSONObject("action") ?: JSONObject())
+                        else -> handler.onHandoff(msg.optJSONObject("approval") ?: JSONObject())
+                    }
+                    reply(ws, rid, payload)
+                } catch (e: Exception) {
+                    Log.e(TAG, "dispatch error for $type", e)
+                    if (rid != null) reply(ws, rid, JSONObject().put("ok", false).put("error", e.message))
+                }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "dispatch error for $type", e)
-            if (rid != null) reply(ws, rid, JSONObject().put("ok", false).put("error", e.message))
+            else -> try {
+                when (type) {
+                    "approval_request" -> handler.onApprovalRequest(msg)
+                    "ask_user" -> handler.onAskUser(msg)
+                    else -> handler.onStatus(msg)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "dispatch error for $type", e)
+            }
         }
     }
 

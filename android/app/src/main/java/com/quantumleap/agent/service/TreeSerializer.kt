@@ -19,6 +19,7 @@ class TreeSerializer {
 
     fun capture(root: AccessibilityNodeInfo?, packageName: String, activity: String): JSONObject {
         nodesByRef.clear()
+        visited = 0
         val elements = JSONArray()
         if (root != null) walk(root, elements, 0, -1)
         return JSONObject()
@@ -34,7 +35,12 @@ class TreeSerializer {
      * preserves the tree's grouping — e.g. a price and a name under the same card share
      * a parent — without losing the flat refs used for actions.
      */
+    private var visited = 0
+
     private fun walk(node: AccessibilityNodeInfo, out: JSONArray, depth: Int, parentRef: Int) {
+        // Bounded: every node is an IPC round-trip into the target app; huge screens
+        // (BookMyShow home) must not stall an observation indefinitely.
+        if (++visited > MAX_VISITED || depth > MAX_DEPTH || nodesByRef.size >= MAX_KEPT) return
         var childDepth = depth
         var childParent = parentRef
         if (isInteresting(node)) {
@@ -72,6 +78,12 @@ class TreeSerializer {
             .put("checked", if (n.isCheckable) n.isChecked else JSONObject.NULL)
             .put("enabled", n.isEnabled)
             .put("bounds", JSONArray(listOf(bounds.left, bounds.top, bounds.right, bounds.bottom)))
+    }
+
+    companion object {
+        private const val MAX_VISITED = 1500     // nodes inspected per observation
+        private const val MAX_KEPT = 250         // elements sent to the brain (it shows ~70)
+        private const val MAX_DEPTH = 60
     }
 
     private fun role(n: AccessibilityNodeInfo): String {
