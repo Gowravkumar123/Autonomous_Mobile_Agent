@@ -44,7 +44,7 @@ STATUS = re.compile(r"\b(status|what are you doing|where are you|how('?s| is) it
                     r"progress|what'?s happening)\b", re.I)
 _SENT = re.compile(r"(?<=[.!?])\s+")
 # "Zoro" as Whisper hears it on a phone mic (seen live: "Hi, Juro.").
-_NAMES = r"zoro|zorro|zoroo|zoru|juro|jurro|joro|jorro|soro|sorro|zolo|zaro|jaro|zuro"
+_NAMES = r"zoro|zorro|zoroo|zoru|juro|jurro|joro|jorro|jiro|jiroh|ziro|soro|sorro|zolo|zaro|jaro|zuro"
 NAME_LEAD = re.compile(rf"^\W*(?:(?:hey|hi|hello|ok|okay|yo|oh)\W+)?(?:{_NAMES})\b[\s,.!?:;-]*",
                        re.I)
 NAME_TAIL = re.compile(rf"[\s,]+(?:{_NAMES})\W*$", re.I)

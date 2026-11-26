@@ -347,6 +347,13 @@ async def addressing_regression() -> None:
 
     task["t"], s.task_id = None, ""
     s._attention_until = 0.0
+    task["t"], s.task_id, s._attention_until = None, "", 0.0
+    _, intent = await s._route("Jiro, what's the capital of Australia?", 0.65, "voice", 2300)
+    check(intent == "new_task" and created[-1] == "What's the capital of Australia?",
+          "third live session: 'Jiro' is recognised as Zoro even outside the window")
+    s._attention_until = 0.0
+    _, intent = await s._route("set the timer to zero for the next round", 0.8, "voice", 1800)
+    check(intent == "ignored_unaddressed", "'zero' in normal speech is not the name")
     reply, intent = await s._route("Hey Zoro", 0.8, "voice", 700)
     check(intent == "wake" and s.attention_open(), "'Hey Zoro' alone -> 'Yes?' and listens")
     _, intent = await s._route("search the weather in Hyderabad", 0.8, "voice", 1600)
