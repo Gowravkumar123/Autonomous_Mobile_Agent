@@ -75,6 +75,8 @@ class ToolRegistry:
         self.rate_per_minute = rate_per_minute
         self.max_calls_per_task = max_calls_per_task
         self.allow_private_fetch = allow_private_fetch
+        from ..kv import MemoryKV
+        self.kv = MemoryKV()                           # shared via Redis when configured
         self._tools: dict[str, ToolSpec] = {}
         self._conns: dict[str, Any] = {}               # server name -> MCPConnection
         self._recent: dict[str, deque] = defaultdict(deque)       # rate limiting
@@ -205,8 +207,11 @@ class ToolRegistry:
         return hashlib.sha256(f"{spec_name}|{json.dumps(args, sort_keys=True, default=str)}"
                               .encode()).hexdigest()
 
-    def _rate_limited(self, name: str) -> bool:
-        now, q = time.monotonic(), self._recent[name]
+    async def _rate_limited(self, name: str) -> bool:
+        from ..kv import MemoryKV, over_limit
+        if not isinstance(self.kv, MemoryKV):          # shared across workers (Redis)
+            return await over_limit(self.kv, f"tool:{name}", self.rate_per_minute)
+        now, q = time.monotonic(), self._recent[name]   # single process: exact sliding window
         while q and now - q[0] > 60:
             q.popleft()
         if len(q) >= self.rate_per_minute:
@@ -229,7 +234,7 @@ class ToolRegistry:
             if self._task_calls[task_id] > self.max_calls_per_task:
                 return ToolResult(False, error=f"tool-call budget exhausted for this task "
                                                f"({self.max_calls_per_task}) — finish or stop")
-        if self._rate_limited(spec.name):
+        if await self._rate_limited(spec.name):
             return ToolResult(False, error=f"rate limit: {spec.name} called more than "
                                            f"{self.rate_per_minute}x in the last minute")
         t0 = time.monotonic()

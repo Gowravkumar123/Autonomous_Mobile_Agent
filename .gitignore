@@ -22,3 +22,5 @@ android/gradle/wrapper/gradle-wrapper.jar
 .DS_Store
 Thumbs.db
 .vscode/
+# Open-source embedding model cache (downloaded on first start)
+backend/models/

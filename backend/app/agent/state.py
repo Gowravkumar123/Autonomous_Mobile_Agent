@@ -44,6 +44,12 @@ class Task(BaseModel):
     executor_hint: str = ""        # intent's suggestion: "api" if tools alone can do it
     # Normalized results of tool calls, newest last: {tool, args, ok, text, cached}.
     tool_results: list[dict] = Field(default_factory=list)
+    # Long-term memory: approved memories retrieved for this task (fed to prompts as data),
+    # and what the user asked to remember / forget in this request.
+    memory_context: list[str] = Field(default_factory=list)
+    memory_remember: list[str] = Field(default_factory=list)
+    memory_forget: list[str] = Field(default_factory=list)
+    memory_only: bool = False          # the request was only "remember/forget ..."
     prompt: str = ""
     state: TaskState = TaskState.CREATED
 

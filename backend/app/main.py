@@ -58,6 +58,22 @@ async def lifespan(app: FastAPI):
             n = await app.state.store.hydrate()
             log.info("Restored %d task(s) from Postgres", n)
 
+    # Long-term memory (pgvector on Neon). The open-source embedding model is loaded once
+    # here (first deploy downloads ~130 MB into embedding_cache_dir).
+    app.state.memory = None
+    if s.memory_enabled:
+        from .agent.memory import make_embedder   # MemoryManager is imported at module top
+        embedder = await make_embedder(s.embedding_backend, s.embedding_model,
+                                       s.embedding_cache_dir, s.embedding_api_url,
+                                       s.embedding_api_key)
+        app.state.memory = MemoryManager(app.state.db, embedder, ttl_days=s.memory_ttl_days,
+                                         include_all_below=s.memory_include_all_below)
+        await app.state.memory.init()
+        log.info("Memory: %s store, embedder %s",
+                 "postgres/pgvector" if app.state.memory.persistent else "in-memory",
+                 embedder.name)
+    app.state.controller.memory = app.state.memory
+
     # Tool layer: built-in research tools + every MCP server in the config file.
     from .tools import ToolRegistry
     app.state.tools = ToolRegistry.from_file(
@@ -67,8 +83,15 @@ async def lifespan(app: FastAPI):
     app.state.controller.tools = app.state.tools
     log.info("Tools: %s", app.state.tools.status())
 
+    # Shared short-lived state: Redis when REDIS_URL is set (multi-worker), else in-process.
+    from .kv import make_kv
+    app.state.kv = await make_kv(s.redis_url)
+    app.state.tools.kv = app.state.kv
+    app.state.controller.kv = app.state.kv
+
     # Authentication (needs the DB for the device registry, so it comes after).
     app.state.auth = AuthManager(s.auth_secret, app.state.db, s.auth_token_days)
+    app.state.auth.kv = app.state.kv
     await app.state.auth.load()
     if not app.state.auth.enabled:
         log.warning("!!! AUTH DISABLED — AUTH_SECRET is not set; every endpoint is OPEN. "
@@ -79,6 +102,7 @@ async def lifespan(app: FastAPI):
              "on" if app.state.auth.enabled else "OFF")
     yield
     await app.state.tools.stop()     # stop MCP server processes / sessions
+    await app.state.kv.close()
     if app.state.db:
         await app.state.db.close()   # flush pending writes on shutdown
 
@@ -130,7 +154,9 @@ async def health(request: Request):
     body = {"ok": True, "llm": app.state.llm.active, "ocr": ocr_available(),
             "db": "postgres" if app.state.db else "in-memory",
             "auth": "on" if app.state.auth.enabled else "OFF",
-            "tools": len(app.state.tools.list())}
+            "tools": len(app.state.tools.list()),
+            "memory": (app.state.memory.embedder.name if app.state.memory else "off"),
+            "state": app.state.kv.name}
     if optional_principal(request) is not None:          # details only for signed-in callers
         body["devices"] = list(app.state.devices._sessions.keys())
     return body
@@ -158,7 +184,7 @@ async def pair_device(body: PairRequest):
 @app.post("/v1/devices/pair/start")
 async def pair_start(_: Principal = Depends(admin)):
     try:
-        code, ttl = app.state.auth.start_pairing()
+        code, ttl = await app.state.auth.start_pairing()
     except AuthError as e:
         raise HTTPException(400, str(e))
     return {"code": code, "expires_in": ttl}
@@ -216,6 +242,65 @@ async def list_tools(p: Principal = Depends(principal)):
 async def refresh_tools(_: Principal = Depends(admin)):
     """Reconnect every MCP server and re-list its tools (after editing the config)."""
     return await app.state.tools.refresh()
+
+
+# --------------------------------------------------------------------------- #
+# Long-term memory (consent: user-approved only; owner-scoped; deletable)
+# --------------------------------------------------------------------------- #
+class MemoryIn(BaseModel):
+    content: str
+    kind: str = "preference"
+
+
+class MemoryQuery(BaseModel):
+    query: str
+
+
+def _mem():
+    if app.state.memory is None:
+        raise HTTPException(503, "memory is disabled (MEMORY_ENABLED=false)")
+    return app.state.memory
+
+
+@app.get("/v1/memory")
+async def list_memory(status: str = "approved", owner: str = "",
+                      p: Principal = Depends(principal)):
+    if status not in ("approved", "pending", "all"):
+        raise HTTPException(422, "status must be approved, pending or all")
+    who = (owner or None) if p.is_admin else p.sub      # devices see only their own
+    return [m.view() for m in await _mem().list(who, status)]
+
+
+@app.post("/v1/memory")
+async def add_memory(body: MemoryIn, p: Principal = Depends(principal)):
+    from .agent.memory import MemoryError_
+    try:
+        item = await _mem().add(p.sub, body.content, kind=body.kind, source="user",
+                                approved=True)
+    except MemoryError_ as e:
+        raise HTTPException(422, str(e))
+    return item.view()
+
+
+@app.post("/v1/memory/{mem_id}/approve")
+async def approve_memory(mem_id: str, p: Principal = Depends(principal)):
+    ok = await _mem().approve(mem_id, None if p.is_admin else p.sub)
+    if not ok:
+        raise HTTPException(404, "memory not found")
+    return {"approved": True}
+
+
+@app.delete("/v1/memory/{mem_id}")
+async def delete_memory(mem_id: str, p: Principal = Depends(principal)):
+    ok = await _mem().delete(mem_id, None if p.is_admin else p.sub)
+    if not ok:
+        raise HTTPException(404, "memory not found")
+    return {"deleted": True}
+
+
+@app.post("/v1/memory/search")
+async def search_memory(body: MemoryQuery, p: Principal = Depends(principal)):
+    return [m.view() for m in await _mem().relevant(p.sub, body.query)]
 
 
 @app.get("/skills")

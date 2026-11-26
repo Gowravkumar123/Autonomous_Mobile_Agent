@@ -51,6 +51,9 @@ class Settings(BaseSettings):
 
     # Persistence — Postgres (e.g. Neon). Empty = in-memory only (tasks lost on restart).
     database_url: str = ""
+    # Shared short-lived state (rate limits, pairing codes/lock, browser-session cap). Only
+    # needed when running several workers; empty = in-process. e.g. rediss://...upstash.io
+    redis_url: str = ""
 
     # Authentication. HMAC key for the signed admin/device tokens. EMPTY = auth DISABLED
     # (every endpoint open — only acceptable on a private network). Generate one with
@@ -77,6 +80,19 @@ class Settings(BaseSettings):
     tool_max_calls_per_task: int = 25
     # Show the tool catalog to phone/browser tasks too (costs prompt tokens every step).
     tools_in_ui_tasks: bool = False
+
+    # Long-term memory (pgvector on Postgres; in-memory without a DB).
+    memory_enabled: bool = True
+    memory_ttl_days: int = 365          # retention: memories expire after this
+    memory_learn: bool = True           # propose (PENDING) preferences after a completed task
+    memory_include_all_below: int = 20  # at most this many approved -> include all, no retrieval
+    # Embeddings: open-source model run locally (fastembed/ONNX) by default; "hashing" is the
+    # dependency-free fallback; "api" = any OpenAI-compatible /embeddings endpoint.
+    embedding_backend: str = "fastembed"
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_cache_dir: str = "models"  # persistent model cache (gitignored)
+    embedding_api_url: str = ""
+    embedding_api_key: str = ""
 
     # Server
     host: str = "0.0.0.0"

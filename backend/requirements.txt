@@ -32,3 +32,11 @@ playwright
 # Tool layer: Model Context Protocol client (v2 SDK) + JSON-schema validation of tool args
 mcp
 jsonschema
+
+# Long-term memory: open-source embedding model run locally via ONNX (BAAI/bge-small-en-v1.5,
+# downloaded once into backend/models). Falls back to a hashing embedder if unavailable.
+fastembed
+
+# Shared short-lived state for multi-worker deployments (only used when REDIS_URL is set).
+# Tests use fakeredis.
+redis

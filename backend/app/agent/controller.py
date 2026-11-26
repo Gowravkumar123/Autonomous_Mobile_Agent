@@ -55,6 +55,8 @@ class AgentController:
         self._resume: dict[str, asyncio.Event] = {}
         self.approval_ttl_s = 900.0
         self.tools = None   # app.tools.ToolRegistry (built-in + MCP), set by the app
+        from ..kv import MemoryKV
+        self.kv = MemoryKV()   # shared short-lived state (Redis when configured)
         self._graph = None  # compiled lazily (imports langgraph on first run)
 
     async def on_device_connected(self, session: DeviceSession) -> None:
@@ -199,6 +201,8 @@ class AgentController:
             if task.state in TERMINAL:
                 return
             await self._execute_phase(task)
+            if task.state == TaskState.COMPLETED:
+                asyncio.create_task(self._learn(task))    # off the critical path
         except Exception as e:  # defensive: never leave a task hung
             log.exception("task %s crashed", task.id)
             import traceback
@@ -266,14 +270,16 @@ class AgentController:
         if not s.browser_enabled:
             task.set_state(TaskState.FAILED, "browser executor is disabled (BROWSER_ENABLED)")
             return None
-        active = sum(1 for d in self.devices._sessions.values()
-                     if getattr(d, "kind", "") == "browser")
-        if active >= s.browser_max_sessions:
+        # Concurrent-browser cap, counted in the shared KV so it holds across workers (the
+        # TTL self-heals the count if a worker dies mid-task).
+        if await self.kv.incr("browser:active", 3600) > s.browser_max_sessions:
+            await self.kv.decr("browser:active")
             task.set_state(TaskState.FAILED, "too many concurrent browser tasks — try again soon")
             return None
         try:
             from ..executors.browser import BrowserSession
         except ImportError:
+            await self.kv.decr("browser:active")
             task.set_state(TaskState.FAILED, "browser executor unavailable (pip install playwright)")
             return None
 
@@ -286,6 +292,7 @@ class AgentController:
             await session.start(task.start_url or "about:blank")
         except Exception as e:
             await session.close()
+            await self.kv.decr("browser:active")
             task.set_state(TaskState.FAILED, f"could not start the browser: {e} "
                                              "(run `playwright install --with-deps chromium`)")
             return None
@@ -384,12 +391,107 @@ class AgentController:
         finally:
             self.devices.remove(session.device_id, session)
             await session.close()
+            await self.kv.decr("browser:active")        # release the concurrency slot
+
+    # ----------------------------------------------------------------- #
+    # Long-term memory
+    # ----------------------------------------------------------------- #
+    @staticmethod
+    def _owner(task: Task) -> str:
+        return task.owner or task.device_id or "admin"
+
+    async def _recall(self, task: Task) -> None:
+        """Approved memories relevant to this request -> task.memory_context (data only)."""
+        if self.memory is None or not hasattr(self.memory, "relevant"):
+            return
+        try:
+            items = await self.memory.relevant(self._owner(task), task.prompt)
+            task.memory_context = [m.content for m in items]
+            if items:
+                task.log("note", f"memory: {len(items)} approved item(s) in context")
+        except Exception as e:                                  # never block a task on memory
+            log.warning("memory recall failed: %s", e)
+
+    async def _apply_memory_requests(self, task: Task) -> list[str]:
+        """Handle explicit 'remember ...' / 'forget ...' from this request."""
+        from .memory import MemoryError_
+        notes: list[str] = []
+        if self.memory is None or not hasattr(self.memory, "add"):
+            return notes
+        owner = self._owner(task)
+        for fact in task.memory_remember:
+            try:
+                item = await self.memory.add(owner, fact, kind="preference",
+                                             source=f"task:{task.id}", approved=True)
+                notes.append(f"Remembered: {item.content}")
+                audit(task.id, "memory_added", item.id, content=item.content)
+            except MemoryError_ as e:
+                notes.append(f"Not stored ({e}): {fact[:80]}")
+        for desc in task.memory_forget:
+            deleted, cands = await self.memory.forget_matching(owner, desc)
+            if deleted:
+                notes.append(f"Forgot: {deleted[0].content}")
+                audit(task.id, "memory_deleted", deleted[0].id, content=deleted[0].content)
+            elif cands:
+                notes.append("Not sure which memory to forget — candidates: " +
+                             "; ".join(f"[{m.id}] {m.content}" for m in cands) +
+                             " (delete one with DELETE /v1/memory/{id})")
+            else:
+                notes.append(f"Nothing in memory matches '{desc}'")
+        for n in notes:
+            task.log("note", n)
+        return notes
+
+    async def _learn(self, task: Task) -> None:
+        """After a COMPLETED task, propose durable preferences — stored PENDING until the
+        user approves them (consent: nothing learned is used before approval)."""
+        from ..config import get_settings
+        from ..llm.prompts import LEARN_SYSTEM, build_learn_user
+        if self.memory is None or not hasattr(self.memory, "add") or \
+                not get_settings().memory_learn or task.executor == "" or task.memory_only:
+            return
+        try:
+            data = await self.llm.complete_json_fast(
+                LEARN_SYSTEM, build_learn_user(task.prompt, task.facts, task.summary,
+                                               task.memory_context),
+                temperature=0.1, max_tokens=600)
+            proposals = [str(x).strip() for x in (data.get("memories") or [])
+                         if str(x).strip()][:3]
+        except Exception as e:
+            log.debug("memory learn skipped: %s", e)
+            return
+        added = []
+        for p in proposals:
+            try:
+                item = await self.memory.add(self._owner(task), p, kind="learned",
+                                             source=f"task:{task.id}", approved=False)
+                if item.status == "pending":
+                    added.append(item)
+            except Exception:
+                continue
+        if added:
+            task.log("memory_proposed", f"{len(added)} preference(s) await your approval",
+                     items=[{"id": m.id, "content": m.content} for m in added])
+            self.store.publish(task.id, "memory_proposed", f"{len(added)} to approve",
+                               items=[m.view() for m in added])
+            self._emit(task)
 
     async def _plan_phase(self, task: Task) -> None:
         task.set_state(TaskState.PLANNING)
         self._emit(task)
+        await self._recall(task)
         await analyze_intent(task, self.llm,
-                             self.tools.names() if self.tools is not None else None)
+                             self.tools.names() if self.tools is not None else None,
+                             task.memory_context)
+        notes = await self._apply_memory_requests(task)
+        if task.memory_only:
+            # "Remember that ..." / "forget ..." alone: done — no app, browser or tools.
+            task.summary = " | ".join(notes) or "Nothing to remember or forget."
+            task.set_state(TaskState.COMPLETED, "memory updated")
+            self._emit(task)
+            return
+        if notes:
+            await self._recall(task)          # include what was just remembered
         await make_plan(task, self.llm)
         audit(task.id, "plan", task.goal, skill=task.skill, plan=task.plan)
         self._emit(task)
@@ -476,7 +578,8 @@ class AgentController:
         user = build_action_user(task.goal, task.facts, plan_summary, task.history, screen,
                                  max_elements=s.max_elements_in_prompt, ocr_items=ocr,
                                  feedback=feedback, executor=task.executor,
-                                 tools_catalog=catalog, tool_results=task.tool_results[-5:])
+                                 tools_catalog=catalog, tool_results=task.tool_results[-5:],
+                                 memories=task.memory_context)
         last_err: Exception | None = None
         # Populated screens: fast gpt-oss text call from the tree (+ grouping). Vision
         # (qwen + a base64 image = many input tokens) is COST-GATED: only fire it on a

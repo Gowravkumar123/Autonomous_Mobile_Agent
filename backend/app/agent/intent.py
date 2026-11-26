@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from ..llm.base import LLMError
 from ..llm.prompts import (INTENT_SYSTEM, PLAN_SYSTEM, build_intent_user,
@@ -40,13 +41,14 @@ def normalize_facts(facts: dict) -> dict:
 
 
 async def analyze_intent(task: Task, llm: LLMRouter,
-                         tool_names: list[str] | None = None) -> None:
+                         tool_names: list[str] | None = None,
+                         memories: list[str] | None = None) -> None:
     """Fill goal / skill / app_hint / facts / clarifications / executor_hint on the task."""
     from ..config import get_settings
     s = get_settings()
     try:
         data = await llm.complete_json_fast(INTENT_SYSTEM,
-                                            build_intent_user(task.prompt, tool_names),
+                                            build_intent_user(task.prompt, tool_names, memories),
                                             temperature=0.1, max_tokens=s.intent_max_tokens)
     except LLMError as e:
         log.warning("intent analysis failed: %s", e)
@@ -57,6 +59,16 @@ async def analyze_intent(task: Task, llm: LLMRouter,
     task.facts = normalize_facts(data.get("facts") or {})
     hint = str(data.get("executor_hint") or "").strip().lower()
     task.executor_hint = "api" if (hint == "api" and tool_names) else ""
+
+    def _strs(v) -> list[str]:
+        if isinstance(v, str):
+            v = [v]
+        return [str(x).strip() for x in (v or []) if str(x).strip()][:5]
+    task.memory_remember = _strs(data.get("remember"))
+    task.memory_forget = _strs(data.get("forget"))
+    task.memory_only = bool(data.get("memory_only")) and bool(
+        task.memory_remember or task.memory_forget)
+    _enforce_memory_command(task)
 
     # Clarifications may be plain strings or {question, choices} objects. Normalize to
     # parallel lists: question text + its concrete choices (so the phone can offer them).
@@ -101,7 +113,8 @@ async def make_plan(task: Task, llm: LLMRouter) -> None:
     skill = registry.get(task.skill)
     try:
         data = await llm.complete_json_fast(
-            PLAN_SYSTEM, build_plan_user(task.goal, task.facts, skill.playbook),
+            PLAN_SYSTEM, build_plan_user(task.goal, task.facts, skill.playbook,
+                                         task.memory_context),
             temperature=0.2, max_tokens=s.plan_max_tokens)
         task.plan = data.get("steps") or []
         task.approval_boundary = data.get("approval_boundary") or skill.approval_boundary
@@ -111,3 +124,33 @@ async def make_plan(task: Task, llm: LLMRouter) -> None:
         task.approval_boundary = skill.approval_boundary
 
     task.log("note", "plan created", steps=task.plan, approval_boundary=task.approval_boundary)
+
+
+# "Remember ...", "forget ...", "note that ...", "keep in mind ..." at the START of a
+# request with no second instruction is a pure memory command. The model marks this
+# inconsistently (live: "Forget how my mom is saved" sometimes fell through to execution,
+# and with no phone online select_executor launched a BROWSER to "forget"). Enforced here.
+_MEMORY_CMD = re.compile(
+    r"^\s*(?:please\s+|ok(?:ay)?\s+|hey\s+\w+[,\s]+|zoro[,\s]+)*"
+    r"(remember|forget|don'?t forget|note that|keep in mind|make a note that)\b[\s,:-]*(.*)$",
+    re.IGNORECASE | re.DOTALL)
+_SECOND_CLAUSE = re.compile(r"\b(and then|then|and also|after that|and (?:book|send|order|"
+                            r"open|call|buy|pay|play|search|message))\b", re.IGNORECASE)
+
+
+def _enforce_memory_command(task: Task) -> None:
+    m = _MEMORY_CMD.match(task.prompt or "")
+    if not m or _SECOND_CLAUSE.search(task.prompt):
+        return
+    verb, rest = m.group(1).lower(), m.group(2).strip().rstrip(".")
+    if rest.lower().startswith("that "):
+        rest = rest[5:].strip()
+    if not rest:
+        return
+    if verb == "forget":
+        if not task.memory_forget:
+            task.memory_forget = [rest]
+        task.memory_remember = []
+    elif not task.memory_remember:
+        task.memory_remember = [f"User noted: {rest}"]
+    task.memory_only = True

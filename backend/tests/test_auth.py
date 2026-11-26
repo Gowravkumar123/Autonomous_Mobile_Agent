@@ -10,6 +10,7 @@ import os
 # Must be set before the app/config is imported (settings are cached).
 os.environ["AUTH_SECRET"] = "test-secret-" + "x" * 40
 os.environ["DATABASE_URL"] = ""
+os.environ["EMBEDDING_BACKEND"] = "hashing"
 os.environ["GROQ_API_KEY"] = ""
 os.environ["GEMINI_API_KEY"] = ""
 

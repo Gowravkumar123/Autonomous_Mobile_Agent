@@ -53,13 +53,6 @@ class Principal:
 
 
 @dataclass
-class _PairCode:
-    code: str
-    expires: float
-    used: bool = False
-
-
-@dataclass
 class _Device:
     device_id: str
     jti: str
@@ -73,8 +66,8 @@ class AuthManager:
         self.db = db
         self.token_days = token_days
         self._devices: dict[str, _Device] = {}
-        self._codes: dict[str, _PairCode] = {}
-        self._fails: list[float] = []
+        from ..kv import MemoryKV
+        self.kv = MemoryKV()          # replaced by the shared KV (Redis) when configured
 
     @property
     def enabled(self) -> bool:
@@ -167,38 +160,37 @@ class AuthManager:
     # ------------------------------------------------------------------ #
     # pairing
     # ------------------------------------------------------------------ #
-    def start_pairing(self) -> tuple[str, int]:
+    # Codes and the failure counter live in the KV (Redis when configured) so a code issued
+    # by one worker can be redeemed on another — exactly once (atomic GETDEL) — and the
+    # brute-force lock counts failures across ALL workers. Keys hold a hash, not the code.
+    @staticmethod
+    def _code_key(code: str) -> str:
+        import hashlib
+        return "pair:code:" + hashlib.sha256(code.encode()).hexdigest()
+
+    async def start_pairing(self) -> tuple[str, int]:
         if not self.enabled:
             raise AuthError("AUTH_SECRET is not set")
-        now = time.time()
-        self._codes = {k: v for k, v in self._codes.items() if v.expires > now and not v.used}
         code = f"{secrets.randbelow(1_000_000):06d}"
-        self._codes[code] = _PairCode(code, now + PAIR_TTL_S)
+        await self.kv.setex(self._code_key(code), "1", PAIR_TTL_S)
         return code, PAIR_TTL_S
 
-    def _locked(self) -> bool:
-        now = time.time()
-        self._fails = [t for t in self._fails if now - t < PAIR_LOCK_WINDOW_S]
-        return len(self._fails) >= PAIR_LOCK_FAILS
+    async def _locked(self) -> bool:
+        return await self.kv.get_int("pair:fails") >= PAIR_LOCK_FAILS
 
     async def complete_pairing(self, code: str, device_id: str) -> str:
         if not self.enabled:
             raise AuthError("auth disabled")
-        if self._locked():
+        if await self._locked():
             raise AuthError("too many failed pairing attempts — try again later")
         device_id = (device_id or "").strip()
         if not device_id or len(device_id) > 80:
             raise AuthError("invalid device id")
         code = (code or "").strip()
-        now = time.time()
-        match = None
-        for c in self._codes.values():                    # constant-time comparison
-            if hmac.compare_digest(c.code, code):
-                match = c
-        if match is None or match.used or match.expires < now:
-            self._fails.append(now)
+        if not (len(code) == 6 and code.isdigit()) or \
+                await self.kv.getdel(self._code_key(code)) is None:
+            await self.kv.incr("pair:fails", PAIR_LOCK_WINDOW_S)
             raise AuthError("invalid or expired pairing code")
-        match.used = True
         token = await self._register(device_id)
         log.info("auth: paired device %s", device_id)
         return token
