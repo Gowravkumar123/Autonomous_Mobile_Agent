@@ -40,3 +40,7 @@ fastembed
 # Shared short-lived state for multi-worker deployments (only used when REDIS_URL is set).
 # Tests use fakeredis.
 redis
+
+# Observability: OpenTelemetry tracing (built-in timeline; export to Langfuse / any OTLP backend)
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http

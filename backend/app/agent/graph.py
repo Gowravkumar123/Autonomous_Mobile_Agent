@@ -60,6 +60,9 @@ log = logging.getLogger("agent.graph")
 MAX_STEPS = 40                 # hard cap on ReAct cycles per task
 MAX_REACT_ATTEMPTS = 4         # reflection re-loop cap (ReAct self-correction)
 MAX_QUESTIONS = 3              # clarifying questions per task (breaks ask-loops)
+MAX_SKIPPED_CONFIRMS = 2       # after this, a go/no-go question goes to the user for real
+STALL_LIMIT = 5                # cycles with no executed action/tool/state change -> stop
+                               # (found by tracing: a silent ask-loop burned 42 LLM calls)
 
 _GO = re.compile(r"^(yes|yeah|ok|okay|sure|save|confirm|proceed|go ahead|continue|do it|send|"
                  r"submit|create|book|add|apply)\b", re.I)
@@ -96,6 +99,8 @@ class AgentState(TypedDict, total=False):
     last_sig: str                         # screen signature BEFORE the last action ran
     pending_validate: bool                # an action ran and awaits validation
     opens: int                            # deterministic open_app attempts (bootstrap)
+    progress_mark: int                    # len(history)+tool results at the last cycle
+    stall: int                            # consecutive cycles without any progress
     status: str                           # run | done | failed | waiting | cancelled
 
 
@@ -281,6 +286,21 @@ def build_react_graph(controller):
                 "again if nothing relevant is visible.")
             c.store.publish(task.id, "reflect", "scroll streak — nudging a tap")
 
+        # --- stall guard (cost protection): no executed action, tool call or answered
+        #     question for STALL_LIMIT cycles => the model is spinning; every extra cycle
+        #     is a paid LLM call. Stop and hand over instead. (Tracing showed a silent
+        #     ask-loop making 42 calls with a constant prompt before the step cap hit.) ---
+        mark = len(task.history) + len(task.tool_results) + len(task.facts)
+        stall = state.get("stall", 0) + 1 if mark == state.get("progress_mark", -1) else 0
+        updates["progress_mark"], updates["stall"] = mark, stall
+        if stall >= STALL_LIMIT:
+            task.summary = c._summarize(task, success=False)
+            task.log("note", f"no progress for {stall} cycles — stopping to save cost")
+            task.set_state(TaskState.WAITING_FOR_USER,
+                           f"no progress for {stall} steps — stopped (please check)")
+            updates["status"] = "waiting"
+            return updates
+
         # --- success marker already on screen? ---
         if is_success(screen, skill, task):
             task.summary = c._summarize(task, success=True)
@@ -392,13 +412,18 @@ def build_react_graph(controller):
             # and the PLATFORM's approval gate still guards anything risky, so skipping the
             # model's own confirmation can never bypass a real approval. The model ignores
             # "don't confirm" instructions, so this is enforced in code.
-            if _is_go_no_go(action):
+            skipped = sum(1 for e in task.events
+                          if e.kind == "note" and e.detail.startswith("skipped a redundant"))
+            if _is_go_no_go(action) and skipped < MAX_SKIPPED_CONFIRMS:
                 task.log("note", "skipped a redundant confirmation question (platform approval "
                                  "still applies) — proceeding")
                 return {"status": "run", "pending_validate": False,
                         "feedback": "Do NOT ask for confirmation — the user already requested "
                                     "this, and the platform asks for approval itself where "
-                                    "needed. Perform the action now."}
+                                    "needed. Perform the action now with call_tool / the "
+                                    "matching action."}
+            # Model insists (or a genuine question): ask the user for real — a human "Save"
+            # resolves what feedback couldn't. Falls through to the question cap below.
             asked = sum(1 for e in task.events if e.kind == "state_change"
                         and e.detail == "needs clarification")
             if asked >= MAX_QUESTIONS:
@@ -512,7 +537,23 @@ def build_react_graph(controller):
             return nxt if state.get("status", "run") == "run" else END
         return route
 
-    nodes = {"observe": observe, "validate": validate, "reason": reason, "act": act}
+    def _traced(name: str, fn):
+        """One span per graph node execution (react.step + resulting status/action)."""
+        from .. import observability as obs
+
+        async def node(state: AgentState) -> dict:
+            with obs.span(f"node.{name}", **{"react.step": state.get("step", 0)}) as sp:
+                out = await fn(state) or {}
+                act = out.get("action")
+                obs.set_attrs(sp, **{
+                    "react.status": out.get("status", state.get("status", "run")),
+                    "react.action": getattr(getattr(act, "type", None), "value", None),
+                    "react.reflection": bool(out.get("feedback"))})
+                return out
+        return node
+
+    nodes = {"observe": _traced("observe", observe), "validate": _traced("validate", validate),
+             "reason": _traced("reason", reason), "act": _traced("act", act)}
     edges = {"observe": "validate", "validate": "reason", "reason": "act", "act": "observe"}
 
     if not _HAS_LANGGRAPH:

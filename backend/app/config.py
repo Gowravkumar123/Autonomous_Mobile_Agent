@@ -51,6 +51,18 @@ class Settings(BaseSettings):
 
     # Persistence — Postgres (e.g. Neon). Empty = in-memory only (tasks lost on restart).
     database_url: str = ""
+    # Observability (OpenTelemetry). A built-in per-task timeline is always on. Set Langfuse
+    # keys to send traces to Langfuse, or OTEL_ENDPOINT for any OTLP/HTTP backend (Jaeger,
+    # Grafana Tempo, ...). Prompts/screens are NOT traced unless TRACE_CONTENT=true.
+    otel_service_name: str = "onepiece-agent"
+    otel_endpoint: str = ""             # e.g. http://localhost:4318/v1/traces
+    otel_headers: str = ""              # "key=value,key2=value2"
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
+    trace_content: bool = False
+    llm_prices_json: str = ""           # {"model": [usd_per_1M_in, usd_per_1M_out]} overrides
+
     # Shared short-lived state (rate limits, pairing codes/lock, browser-session cap). Only
     # needed when running several workers; empty = in-process. e.g. rediss://...upstash.io
     redis_url: str = ""

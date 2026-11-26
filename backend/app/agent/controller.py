@@ -192,6 +192,28 @@ class AgentController:
     # Main driver
     # ----------------------------------------------------------------- #
     async def run_task(self, task: Task) -> None:
+        """Root span for the whole task + per-task token/cost accounting."""
+        from .. import observability as obs
+        task.usage = obs.begin_task_usage()          # filled live by every LLM call
+        with obs.span("task", **{"task.id": task.id, "task.owner": task.owner or "",
+                                 "task.prompt_chars": len(task.prompt or "")}) as sp:
+            try:
+                await self._run_task_inner(task)
+            finally:
+                u = task.usage or {}
+                obs.set_attrs(sp, **{
+                    "task.state": task.state.value, "task.executor": task.executor,
+                    "task.skill": task.skill, "task.steps": len(task.history),
+                    "task.llm_calls": u.get("llm_calls", 0),
+                    "task.input_tokens": u.get("input_tokens", 0),
+                    "task.output_tokens": u.get("output_tokens", 0),
+                    "task.reasoning_tokens": u.get("reasoning_tokens", 0),
+                    "task.est_cost_usd": u.get("est_cost_usd", 0.0)})
+                if task.state == TaskState.FAILED:
+                    obs.mark_error(sp, task.error or "task failed")
+                self._emit(task)                         # persist the final usage
+
+    async def _run_task_inner(self, task: Task) -> None:
         session = None
         try:
             await self._plan_phase(task)
@@ -362,7 +384,13 @@ class AgentController:
             task.approvals_granted += 1
             task.set_state(TaskState.RUNNING)
 
-        res = await self.tools.call(spec, args, task.id)
+        from .. import observability as obs
+        with obs.span("tool.call", **{"tool.name": name, "tool.source": spec.source,
+                                      "tool.policy": spec.policy, "tool.risk": spec.risk}) as sp:
+            res = await self.tools.call(spec, args, task.id)
+            obs.set_attrs(sp, **{"tool.ok": res.ok, "tool.cached": res.cached})
+            if not res.ok:
+                obs.mark_error(sp, res.error or "tool error")
         return record(res.ok, res.for_model(), cached=res.cached, error=res.error,
                       elapsed=res.elapsed_s)
 
@@ -404,13 +432,17 @@ class AgentController:
         """Approved memories relevant to this request -> task.memory_context (data only)."""
         if self.memory is None or not hasattr(self.memory, "relevant"):
             return
-        try:
-            items = await self.memory.relevant(self._owner(task), task.prompt)
-            task.memory_context = [m.content for m in items]
-            if items:
-                task.log("note", f"memory: {len(items)} approved item(s) in context")
-        except Exception as e:                                  # never block a task on memory
-            log.warning("memory recall failed: %s", e)
+        from .. import observability as obs
+        with obs.span("memory.recall") as sp:
+            try:
+                items = await self.memory.relevant(self._owner(task), task.prompt)
+                task.memory_context = [m.content for m in items]
+                obs.set_attrs(sp, **{"memory.items": len(items)})
+                if items:
+                    task.log("note", f"memory: {len(items)} approved item(s) in context")
+            except Exception as e:                              # never block a task on memory
+                obs.mark_error(sp, str(e))
+                log.warning("memory recall failed: %s", e)
 
     async def _apply_memory_requests(self, task: Task) -> list[str]:
         """Handle explicit 'remember ...' / 'forget ...' from this request."""
@@ -477,6 +509,16 @@ class AgentController:
             self._emit(task)
 
     async def _plan_phase(self, task: Task) -> None:
+        from .. import observability as obs
+        with obs.span("plan") as sp:
+            await self._plan_phase_inner(task)
+            obs.set_attrs(sp, **{"task.skill": task.skill,
+                                 "task.executor_hint": task.executor_hint or "ui",
+                                 "task.plan_steps": len(task.plan),
+                                 "task.clarifications": len(task.clarifications),
+                                 "task.memory_only": task.memory_only})
+
+    async def _plan_phase_inner(self, task: Task) -> None:
         task.set_state(TaskState.PLANNING)
         self._emit(task)
         await self._recall(task)
@@ -521,7 +563,7 @@ class AgentController:
         initial_state = {
             "task": task, "skill": skill, "screen": None, "action": None,
             "feedback": "", "react_attempts": 0, "blind": 0, "disconnects": 0,
-            "step": 0, "last_sig": "", "pending_validate": False, "opens": 0,
+            "step": 0, "last_sig": "", "pending_validate": False, "opens": 0, "progress_mark": -1, "stall": 0,
             "status": "run",
         }
         # recursion_limit counts node executions (~4 per ReAct cycle); the in-node
@@ -550,8 +592,16 @@ class AgentController:
             await asyncio.sleep(1.0)
 
     async def _observe(self, device: DeviceSession) -> ScreenObservation:
-        payload = await device.request("observe")
-        return ScreenObservation(**(payload.get("screen", payload)))
+        from .. import observability as obs
+        # Device latency is where this deployment hurts most (phone <-> cloud link), so
+        # every observe is timed per executor kind.
+        with obs.span("device.observe", **{"device.kind": getattr(device, "kind", "phone")}) as sp:
+            payload = await device.request("observe")
+            screen = ScreenObservation(**(payload.get("screen", payload)))
+            obs.set_attrs(sp, **{"device.elements": len(screen.elements),
+                                 "device.screenshot": bool(screen.screenshot_b64),
+                                 "device.app": screen.app_package})
+            return screen
 
     async def _decide(self, task: Task, skill, screen: ScreenObservation,
                       feedback: str = "") -> AgentAction:
@@ -603,18 +653,24 @@ class AgentController:
                            thought=str(last_err))
 
     async def _act(self, device: DeviceSession, action: AgentAction, task: Task) -> None:
+        from .. import observability as obs
         payload = action.model_dump(mode="json")
-        for attempt in range(2):
-            try:
-                await device.request("act", action=payload)
-                break
-            except (RuntimeError, OSError, asyncio.TimeoutError):
-                if attempt == 1:
-                    raise
-                fresh = await self._await_device(task)   # reconnected session, if any
-                if fresh is None:
-                    raise
-                device = fresh
+        with obs.span("device.act", **{"device.kind": getattr(device, "kind", "phone"),
+                                       "device.action": action.type.value}) as sp:
+            for attempt in range(2):
+                try:
+                    res = await device.request("act", action=payload)
+                    if isinstance(res, dict) and res.get("ok") is False:
+                        obs.set_attrs(sp, **{"device.act_error": str(res.get("error", ""))[:200]})
+                    break
+                except (RuntimeError, OSError, asyncio.TimeoutError):
+                    obs.set_attrs(sp, **{"device.retried": True})
+                    if attempt == 1:
+                        raise
+                    fresh = await self._await_device(task)   # reconnected session, if any
+                    if fresh is None:
+                        raise
+                    device = fresh
         label = self._action_label(action)
         task.history.append(label)
         self.store.publish(task.id, "action", label, risk=action.risk_level)
@@ -656,19 +712,26 @@ class AgentController:
         self.store.publish(task.id, "approval", decision.reason, approval=payload)
         audit(task.id, "approval_requested", decision.reason, approval=payload)
 
-        try:
-            approved, note = await asyncio.wait_for(fut, timeout=self.approval_ttl_s)
-            outcome = rec.decision if rec.decision != PENDING else (APPROVED if approved else REJECTED)
-            if task.cancel_requested:
-                outcome = "cancelled"
-        except asyncio.TimeoutError:
-            rec.decide(EXPIRED, "system", "no decision before expiry")
-            self._persist_approval(rec)
-            outcome, note = EXPIRED, "expired"
-        finally:
-            self._approvals.pop(task.id, None)
-            self._pending_prompts.pop(task.id, None)
-            task.pending_approval_id = ""
+        from .. import observability as obs
+        # Human wait time is its own span: it dominates wall-clock for sensitive tasks and
+        # must not be mistaken for agent latency.
+        with obs.span("approval.wait", **{"approval.id": rec.approval_id,
+                                          "approval.risk": decision.risk_level}) as sp:
+            try:
+                approved, note = await asyncio.wait_for(fut, timeout=self.approval_ttl_s)
+                outcome = rec.decision if rec.decision != PENDING else (
+                    APPROVED if approved else REJECTED)
+                if task.cancel_requested:
+                    outcome = "cancelled"
+            except asyncio.TimeoutError:
+                rec.decide(EXPIRED, "system", "no decision before expiry")
+                self._persist_approval(rec)
+                outcome, note = EXPIRED, "expired"
+            finally:
+                self._approvals.pop(task.id, None)
+                self._pending_prompts.pop(task.id, None)
+                task.pending_approval_id = ""
+            obs.set_attrs(sp, **{"approval.outcome": outcome})
         audit(task.id, "approval_decided", outcome, note=note, approval_id=rec.approval_id)
         self.store.publish(task.id, "approval_decided", outcome, approval_id=rec.approval_id)
         return outcome, rec.action_hash

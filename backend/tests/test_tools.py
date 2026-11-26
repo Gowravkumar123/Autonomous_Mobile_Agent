@@ -247,6 +247,38 @@ async def agent_tests():
     check(not asked and len(c.approvals_for(t.id)) == 1 and t.state == TaskState.COMPLETED,
           "go/no-go confirmation skipped; exactly one platform approval")
 
+    # 7b. LIVE regression (found by tracing): a model that ONLY ever asks "Save / Cancel".
+    #     Skipped confirmations left no history, so nothing stopped it until the 40-step
+    #     cap (42 paid LLM calls). Now: 2 skips, then real questions (capped), then the
+    #     stall guard stops it — with a bounded number of model calls.
+    calls = {"n": 0}
+    c, store = make([])
+
+    async def nagging(task, skill, screen, feedback=""):
+        calls["n"] += 1
+        return AgentAction(type=ActionType.ASK_USER, text="Save the note?",
+                           options=["Save the note", "Cancel"])
+    c._decide = nagging                                     # type: ignore[assignment]
+    t = Task(prompt="x", executor="api", owner="admin", goal="x", skill="generic")
+    store.create(t)
+
+    async def answerer():
+        while True:
+            fut = c._answers.get(t.id)
+            if fut is not None and not fut.done():
+                c.resolve_answer(t.id, {"clarification_answer": "Save the note"})
+            await asyncio.sleep(0.02)
+    helper = asyncio.create_task(answerer())
+    session = await c._select_executor(t)
+    try:
+        await asyncio.wait_for(c._execute_phase(t), 60)
+    finally:
+        helper.cancel()
+        c.devices.remove(session.device_id, session)
+    check(t.state == TaskState.WAITING_FOR_USER and "no progress" in t.events[-1].detail
+          and calls["n"] <= 12,
+          f"ask-loop stopped by the stall guard after {calls['n']} model calls (was 40+)")
+
     # 8. select_executor auto: intent hint 'api' + tools -> api
     store, devices = TaskStore(), DeviceRegistry()
     c = AgentController(LLMRouter(Settings(groq_api_key="")), PolicyEngine(0), devices,

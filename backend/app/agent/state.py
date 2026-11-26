@@ -50,6 +50,8 @@ class Task(BaseModel):
     memory_remember: list[str] = Field(default_factory=list)
     memory_forget: list[str] = Field(default_factory=list)
     memory_only: bool = False          # the request was only "remember/forget ..."
+    # LLM usage for this task: calls, input/output/reasoning tokens, estimated cost.
+    usage: dict = Field(default_factory=dict)
     prompt: str = ""
     state: TaskState = TaskState.CREATED
 

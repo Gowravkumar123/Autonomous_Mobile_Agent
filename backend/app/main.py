@@ -35,6 +35,8 @@ log = logging.getLogger("agent.main")
 async def lifespan(app: FastAPI):
     s = get_settings()
     app.state.settings = s
+    from . import observability as obs
+    app.state.tracing = obs.setup(s)
     app.state.store = TaskStore()
     app.state.devices = DeviceRegistry()
     app.state.llm = LLMRouter(s)
@@ -97,12 +99,17 @@ async def lifespan(app: FastAPI):
         log.warning("!!! AUTH DISABLED — AUTH_SECRET is not set; every endpoint is OPEN. "
                     "Generate one: python -m app.auth.cli new-secret")
 
+    # Compile the ReAct graph NOW: built lazily it cost the first task after every restart
+    # ~6s (LangGraph import + compile) — found via the trace timeline.
+    _ = app.state.controller.graph
+
     log.info("Agent backend ready. LLM: %s | DB: %s | auth: %s", app.state.llm.active,
              "postgres" if app.state.db else "in-memory",
              "on" if app.state.auth.enabled else "OFF")
     yield
     await app.state.tools.stop()     # stop MCP server processes / sessions
     await app.state.kv.close()
+    obs.shutdown()                   # flush pending spans to the exporter
     if app.state.db:
         await app.state.db.close()   # flush pending writes on shutdown
 
@@ -133,7 +140,7 @@ def _task_view(task: Task, full: bool = False) -> dict:
     view = {
         "task_id": task.id, "state": task.state.value, "prompt": task.prompt,
         "device_id": task.device_id, "owner": task.owner, "executor": task.executor,
-        "evidence": task.evidence, "tool_results": task.tool_results,
+        "evidence": task.evidence, "tool_results": task.tool_results, "usage": task.usage,
         "goal": task.goal, "skill": task.skill, "app_hint": task.app_hint,
         "facts": task.facts, "plan": task.plan, "approval_boundary": task.approval_boundary,
         "summary": task.summary, "error": task.error, "step_id": task.step_id,
@@ -156,7 +163,7 @@ async def health(request: Request):
             "auth": "on" if app.state.auth.enabled else "OFF",
             "tools": len(app.state.tools.list()),
             "memory": (app.state.memory.embedder.name if app.state.memory else "off"),
-            "state": app.state.kv.name}
+            "state": app.state.kv.name, "tracing": app.state.tracing}
     if optional_principal(request) is not None:          # details only for signed-in callers
         body["devices"] = list(app.state.devices._sessions.keys())
     return body
@@ -356,6 +363,52 @@ async def pause_task(task_id: str, p: Principal = Depends(principal)):
 async def resume_task(task_id: str, p: Principal = Depends(principal)):
     _own_task(p, task_id)
     return {"ok": app.state.controller.resume(task_id)}
+
+
+@app.get("/v1/tasks/{task_id}/trace")
+async def task_trace(task_id: str, p: Principal = Depends(principal)):
+    """Built-in timeline of the task's spans (works with no tracing backend): where the
+    time went (model vs device vs human approval) and token usage / estimated cost."""
+    from . import observability as obs
+    task = _own_task(p, task_id)
+    spans = obs.STORE.timeline(task_id)
+    by_kind: dict[str, float] = {}
+    for s in spans:
+        kind = s["name"].split(".")[0]
+        if s["name"] in ("llm.chat", "device.observe", "device.act", "tool.call",
+                         "approval.wait", "memory.recall"):
+            by_kind[kind] = round(by_kind.get(kind, 0.0) + s["duration_ms"], 1)
+    root = next((s for s in spans if s["name"] == "task"), None)
+    return {"task_id": task_id, "state": task.state.value, "usage": task.usage,
+            "total_ms": root["duration_ms"] if root else None,
+            "time_by_kind_ms": by_kind, "spans": spans}
+
+
+@app.get("/v1/usage")
+async def usage_summary(_: Principal = Depends(admin)):
+    """Token usage and estimated cost across recent tasks (cost-efficiency view)."""
+    totals = {"tasks": 0, "llm_calls": 0, "input_tokens": 0, "output_tokens": 0,
+              "reasoning_tokens": 0, "est_cost_usd": 0.0}
+    by_model: dict[str, dict] = {}
+    per_task = []
+    for t in app.state.store.all():
+        u = t.usage or {}
+        if not u.get("llm_calls"):
+            continue
+        totals["tasks"] += 1
+        for k in ("llm_calls", "input_tokens", "output_tokens", "reasoning_tokens"):
+            totals[k] += int(u.get(k, 0))
+        totals["est_cost_usd"] = round(totals["est_cost_usd"] + float(u.get("est_cost_usd", 0)), 6)
+        for model, m in (u.get("by_model") or {}).items():
+            agg = by_model.setdefault(model, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
+            for k in agg:
+                agg[k] += int(m.get(k, 0))
+        per_task.append({"task_id": t.id, "prompt": t.prompt[:80], "state": t.state.value,
+                         "llm_calls": u.get("llm_calls"), "est_cost_usd": u.get("est_cost_usd")})
+    per_task.sort(key=lambda x: x["est_cost_usd"] or 0, reverse=True)
+    return {"totals": totals, "by_model": by_model, "top_tasks": per_task[:20],
+            "note": "est_cost_usd is the paid-tier equivalent at approximate list prices; "
+                    "Groq's free tier costs $0. Override prices with LLM_PRICES_JSON."}
 
 
 @app.get("/v1/tasks/{task_id}/evidence/{name}")
