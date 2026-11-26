@@ -315,7 +315,42 @@ def http_tests():
     os.unlink(cfg.name)
 
 
+
+async def web_search_fallback() -> None:
+    """Live on the server, DuckDuckGo returned nothing (data-centre IP) and Wikipedia
+    403'd the old browser-lookalike User-Agent. Now: DDG first, Wikipedia search second."""
+    import httpx
+    from app.tools import builtins as bt
+    seen_ua = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_ua.append(request.headers.get("user-agent", ""))
+        if "duckduckgo" in request.url.host:
+            return httpx.Response(202, text="<html>challenge</html>")
+        if request.url.host == "en.wikipedia.org":
+            return httpx.Response(200, json={"query": {"search": [
+                {"title": "Canberra", "snippet": "<span>Canberra</span> is the capital city"}]}})
+        return httpx.Response(404)
+    r = await bt.web_search({"query": "capital of Australia"}, transport=httpx.MockTransport(handler))
+    check(r.ok and "Canberra" in r.text and "results from Wikipedia" in r.text and
+          r.structured[0]["url"] == "https://en.wikipedia.org/wiki/Canberra",
+          "web.search: DDG blocked -> Wikipedia fallback")
+    check(all(ua == bt.UA and not ua.startswith("Mozilla") for ua in seen_ua),
+          "web tools send the honest OnePieceAgent User-Agent")
+
+    def ddg_ok(request):
+        if "duckduckgo" in request.url.host:
+            return httpx.Response(200, text='<a class="result__a" href="https://example.org/x">X</a>'
+                                            '<a class="result__snippet">snip</a>')
+        raise AssertionError("fallback must not run when DDG has results")
+    r = await bt.web_search({"query": "x"}, transport=httpx.MockTransport(ddg_ok))
+    check(r.ok and "results from Wikipedia" not in r.text, "web.search: DDG results used first")
+    r = await bt.web_search({"query": "x"}, transport=httpx.MockTransport(
+        lambda req: httpx.Response(403)))
+    check(not r.ok and "no results" in r.error, "web.search: both down -> clear error, no raise")
+
 async def main():
+    await web_search_fallback()
     port = free_port()
     srv = subprocess.Popen([sys.executable, "-m", "tests.mcp_test_server", "--http", str(port)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

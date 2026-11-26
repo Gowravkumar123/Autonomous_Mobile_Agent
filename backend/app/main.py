@@ -79,6 +79,9 @@ async def lifespan(app: FastAPI):
 
     # Tool layer: built-in research tools + every MCP server in the config file.
     from .tools import ToolRegistry
+    if s.tools_user_agent.strip():
+        from .tools import builtins as _bt
+        _bt.UA = s.tools_user_agent.strip()
     app.state.tools = ToolRegistry.from_file(
         s.mcp_config_path, builtins=s.tools_builtin, timeout_s=s.tool_timeout_s,
         rate_per_minute=s.tool_rate_per_minute, max_calls_per_task=s.tool_max_calls_per_task)

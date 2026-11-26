@@ -491,6 +491,17 @@ class VoiceSession:
                 return "I couldn't finish that. " + _short(data.get("error") or "")
             if detail == "PAUSED":
                 return "Paused. Say resume when you're ready."
+            summary = data.get("summary") or ""
+            if detail == "WAITING_FOR_USER" and summary and self.pending.kind == "" \
+                    and self._final_spoken != ev.get("task_id"):
+                # The task stopped with a result for the user but it isn't a verified
+                # completion (e.g. the model answered after every tool failed, or a step
+                # the user must finish elsewhere). Say it, honestly labelled.
+                self._final_spoken = ev.get("task_id", "")
+                if summary.startswith("[UNVERIFIED]"):
+                    return ("I couldn't confirm this with a source, but: "
+                            + _clean_summary(summary))
+                return _clean_summary(summary)
             return ""
         if kind == "action" and self.cfg.progress_every_s > 0:
             now = time.monotonic()

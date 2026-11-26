@@ -386,6 +386,37 @@ async def addressing_regression() -> None:
     await s.close()
 
 
+async def narration_unverified() -> None:
+    """Live on the server: every web tool failed, the model answered anyway, the task
+    ended WAITING_FOR_USER '[UNVERIFIED] ...' — and nothing was spoken."""
+    from app.voice.session import Backend, VoiceSession
+    q: asyncio.Queue = asyncio.Queue()
+
+    async def lookup(_):
+        return None
+    b = Backend(create_task=lambda p: asyncio.sleep(0, "t"), lookup=lookup,
+                ctl=lambda *a, **k: asyncio.sleep(0), subscribe=lambda: q,
+                unsubscribe=lambda _q: None, stt=fake_stt, tts=fake_tts)
+    s = VoiceSession("narr", "phone", b)
+    s.task_id = "t9"
+    ev = {"task_id": "t9", "kind": "state", "detail": "WAITING_FOR_USER",
+          "data": {"summary": "[UNVERIFIED] The capital city of Australia is Canberra."}}
+    line = s._narrate(ev)
+    check(line.startswith("I couldn't confirm this with a source, but:") and "Canberra" in line,
+          "unverified answer is spoken, honestly labelled")
+    check(s._narrate(ev) == "", "...once (the state is emitted again)")
+    s.task_id, s._final_spoken = "t10", ""
+    ev2 = {"task_id": "t10", "kind": "state", "detail": "WAITING_FOR_USER",
+           "data": {"summary": "This step needs you (payment). Finish it in your browser."}}
+    check("Finish it in your browser" in s._narrate(ev2), "handoff summaries are spoken too")
+    from app.voice.session import Pending
+    s.task_id, s._final_spoken, s.pending = "t11", "", Pending("ask", "t11")
+    ev3 = {"task_id": "t11", "kind": "state", "detail": "WAITING_FOR_USER",
+           "data": {"summary": "x"}}
+    check(s._narrate(ev3) == "", "not while a question/approval is pending (it has its own line)")
+    await s.close()
+
+
 async def e2e() -> None:
     import httpx
     import uvicorn
@@ -643,6 +674,7 @@ async def main() -> None:
     unit_audio()
     await live_regression()
     await addressing_regression()
+    await narration_unverified()
     await e2e()
     await webrtc_check()
     print(f"\nVOICE PASS  ({PASS} checks)")

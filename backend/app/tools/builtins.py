@@ -25,7 +25,11 @@ import httpx
 from .base import ALLOW, ToolError, ToolResult, ToolSpec
 
 MAX_BYTES = 1_000_000
-UA = "Mozilla/5.0 (compatible; OnePieceAgent/0.3; +research tool)"
+# Identify honestly (app/version + what it is). Wikimedia 403s browser-lookalike UAs —
+# that broke every Wikipedia fetch on the server. Override with TOOLS_USER_AGENT (e.g. to
+# add a contact URL/e-mail as Wikimedia's policy asks).
+UA = "OnePieceAgent/0.4 (self-hosted personal assistant) httpx"
+WIKI_API = "https://en.wikipedia.org/w/api.php"
 
 
 async def _assert_public(url: str, allow_private: bool = False) -> None:
@@ -61,9 +65,10 @@ def _html_to_text(doc: str) -> tuple[str, str]:
     return title, text
 
 
-async def fetch_text(url: str, max_chars: int = 6000, allow_private: bool = False) -> tuple[str, str, str]:
+async def fetch_text(url: str, max_chars: int = 6000, allow_private: bool = False,
+                     transport=None) -> tuple[str, str, str]:
     """GET with manual, re-validated redirects. Returns (final_url, title, text)."""
-    async with httpx.AsyncClient(timeout=15, follow_redirects=False,
+    async with httpx.AsyncClient(timeout=15, follow_redirects=False, transport=transport,
                                  headers={"User-Agent": UA}) as client:
         for _ in range(4):
             await _assert_public(url, allow_private)
@@ -114,23 +119,53 @@ def _unwrap_ddg(href: str) -> str:
     return q.get("uddg", [href])[0]
 
 
-async def web_search(args: dict, *, search_url: str = "https://html.duckduckgo.com/html/") -> ToolResult:
+async def _ddg(client: httpx.AsyncClient, url: str, query: str, n: int) -> list[dict]:
+    try:
+        r = await client.post(url, data={"q": query})
+    except httpx.HTTPError:
+        return []
+    if r.status_code != 200:            # 202 = bot challenge (typical from data centres)
+        return []
+    out = []
+    for href, title, snippet in _DDG_RESULT.findall(r.text):
+        out.append({"title": _clean(title), "url": _unwrap_ddg(href), "snippet": _clean(snippet)})
+        if len(out) >= n:
+            break
+    return out
+
+
+async def _wikipedia(client: httpx.AsyncClient, api: str, query: str, n: int) -> list[dict]:
+    """Encyclopedic fallback: Wikipedia's search API (bot-friendly, works from servers)."""
+    try:
+        r = await client.get(api, params={"action": "query", "list": "search", "srsearch": query,
+                                          "srlimit": n, "format": "json", "utf8": 1})
+        hits = r.json().get("query", {}).get("search", []) if r.status_code == 200 else []
+    except (httpx.HTTPError, ValueError):
+        return []
+    return [{"title": h.get("title", ""),
+             "url": "https://en.wikipedia.org/wiki/" + up.quote(h.get("title", "").replace(" ", "_")),
+             "snippet": _clean(h.get("snippet", ""))} for h in hits[:n]]
+
+
+async def web_search(args: dict, *, search_url: str = "https://html.duckduckgo.com/html/",
+                     wiki_api: str = WIKI_API, transport=None) -> ToolResult:
+    """DuckDuckGo first; if it returns nothing (it blocks many data-centre IPs — every
+    search failed on the Hetzner server), fall back to Wikipedia search."""
     t0 = time.monotonic()
     query = str(args["query"]).strip()
     n = max(1, min(int(args.get("max_results") or 5), 10))
-    async with httpx.AsyncClient(timeout=15, headers={"User-Agent": UA}) as client:
-        r = await client.post(search_url, data={"q": query})
-    if r.status_code >= 400:
-        raise ToolError(f"search failed: HTTP {r.status_code}")
-    results = []
-    for href, title, snippet in _DDG_RESULT.findall(r.text):
-        results.append({"title": _clean(title), "url": _unwrap_ddg(href), "snippet": _clean(snippet)})
-        if len(results) >= n:
-            break
+    async with httpx.AsyncClient(timeout=15, headers={"User-Agent": UA},
+                                 transport=transport) as client:
+        results, source = await _ddg(client, search_url, query, n), "web"
+        if not results:
+            results, source = await _wikipedia(client, wiki_api, query, n), "wikipedia"
     if not results:
-        return ToolResult(False, error="no results (the search engine may have rate-limited us)",
+        return ToolResult(False, error="no results (web search unavailable from this server, "
+                                       "and Wikipedia had no match)",
                           elapsed_s=time.monotonic() - t0)
-    text = "\n".join(f"{i+1}. {x['title']} — {x['url']}\n   {x['snippet']}" for i, x in enumerate(results))
+    head = "" if source == "web" else "(web search unavailable; results from Wikipedia)\n"
+    text = head + "\n".join(f"{i+1}. {x['title']} — {x['url']}\n   {x['snippet']}"
+                             for i, x in enumerate(results))
     return ToolResult(True, text, results, elapsed_s=time.monotonic() - t0)
 
 

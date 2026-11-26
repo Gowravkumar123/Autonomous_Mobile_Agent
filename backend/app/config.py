@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     # included). Empty = any domain.
     browser_allowed_domains: str = ""
     browser_search_url: str = "https://duckduckgo.com/html/?q={q}"
+    tools_user_agent: str = ""           # override the web tools' User-Agent (add a contact)
     browser_max_sessions: int = 2      # concurrent browser tasks (resource limit)
 
     # Tools (built-in + MCP servers). The MCP config file is gitignored (it may reference
