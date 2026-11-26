@@ -213,6 +213,16 @@ BROWSER_HINT = (
     "then `enter` to submit. `back` = browser back.\n")
 
 
+DESKTOP_HINT = (
+    "EXECUTOR: Windows desktop app. ELEMENTS are UI Automation controls of ONE window "
+    "(CURRENT APP = its .exe, SCREEN = its title). `tap` buttons/checkboxes/list items by ref; "
+    "`type` sets an Edit field's text by ref; `enter` submits the field you typed in; "
+    "`scroll` scrolls a list. `open_app` with a window title or app name switches to that "
+    "window (only allowlisted apps). File paths must be inside the user's workspace folder. "
+    "There is no back/home button — tap the app's own controls. If an action comes back "
+    "REFUSED, do not repeat it; choose another way or `fail` with the reason.\n")
+
+
 API_HINT = (
     "EXECUTOR: API/MCP tools — there is NO screen. Use `call_tool` to look things up or act, "
     "reading each TOOL RESULT before the next step. Never invent a tool result. To change "
@@ -269,6 +279,7 @@ def build_action_user(goal: str, facts: dict, plan_summary: str,
     return (
         "MODE: action\n"
         + (BROWSER_HINT if executor == "browser" else "")
+        + (DESKTOP_HINT if executor == "desktop" else "")
         + (API_HINT if executor == "api" else "")
         + f"GOAL: {goal}\n"
         f"KNOWN FACTS: {json.dumps(facts)}\n"

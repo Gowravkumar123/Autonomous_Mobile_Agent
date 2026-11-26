@@ -251,12 +251,26 @@ class AgentController:
         r"(?:/|\b)(?!@)|\b(?:website|web ?site|on the web|in the browser|in a browser)\b",
         re.IGNORECASE)
 
+    # "on my laptop / in Notepad / in Excel ..." -> the desktop companion, if one is online.
+    _DESKTOP_RE = re.compile(
+        r"\b(?:on|in|from) (?:my |the )?(?:desktop|computer|laptop|pc|windows)\b|"
+        r"\b(?:notepad|excel|word document|calculator|file explorer|outlook desktop)\b",
+        re.IGNORECASE)
+
+    def _sessions_of(self, kind: str) -> list:
+        return [d for d in self.devices._sessions.values() if getattr(d, "kind", "") == kind]
+
     def _phone_connected(self) -> bool:
-        return any(getattr(d, "kind", "") != "browser" for d in self.devices._sessions.values())
+        return bool(self._sessions_of("phone"))
 
     def _choose_executor(self, task: Task) -> str:
-        if task.executor in ("mobile", "browser", "api"):
+        if task.executor in ("mobile", "browser", "api", "desktop"):
             return task.executor
+        if task.device_id.startswith("desktop-"):
+            return "desktop"
+        if self._DESKTOP_RE.search(task.prompt) and (
+                self._sessions_of("desktop") or task.owner.startswith("desktop-")):
+            return "desktop"
         if task.start_url or self._WEB_RE.search(task.prompt):
             return "browser"
         # Intent judged the goal doable with the registered tools alone (no UI).
@@ -284,6 +298,24 @@ class AgentController:
             task.log("note", f"executor: api ({len(self.tools.names())} tools)")
             self._emit(task)
             return session
+        if task.executor == "desktop":
+            # Bind to the desktop companion: the named one, the owner's own, or the only
+            # one online. Never guess between several.
+            if not task.device_id.startswith("desktop-"):
+                desks = self._sessions_of("desktop")
+                if task.owner.startswith("desktop-"):
+                    task.device_id = task.owner
+                elif len(desks) == 1:
+                    task.device_id = desks[0].device_id
+                else:
+                    task.set_state(TaskState.FAILED,
+                                   "no desktop companion is connected" if not desks else
+                                   "several desktops are connected — pick one with device_id")
+                    return None
+            audit(task.id, "executor", "desktop", device=task.device_id)
+            task.log("note", f"executor: desktop ({task.device_id})")
+            self._emit(task)
+            return None
         if task.executor != "browser":
             audit(task.id, "executor", "mobile", device=task.device_id)
             task.log("note", f"executor: mobile ({task.device_id or 'any phone'})")
@@ -399,7 +431,7 @@ class AgentController:
         the owner's phone if it's connected (else the user answers via the API)."""
         if task.owner and task.owner != "admin":
             phone = self.devices.get(task.owner)
-            if phone is not None and getattr(phone, "kind", "") != "browser":
+            if phone is not None and getattr(phone, "kind", "") in ("phone", "desktop"):
                 await phone.push(type_, **data)
 
     async def _close_browser(self, task: Task, session) -> None:
@@ -583,8 +615,7 @@ class AgentController:
             # A task bound to a device runs ONLY on that device (never fall back to some
             # other connected phone); unbound tasks may use any connected PHONE.
             dev = (self.devices.get(task.device_id) if task.device_id
-                   else next((d for d in self.devices._sessions.values()
-                              if getattr(d, "kind", "") != "browser"), None))
+                   else next(iter(self._sessions_of("phone")), None))
             if dev is not None:
                 return dev
             if task.cancel_requested or loop.time() >= deadline:
@@ -655,6 +686,7 @@ class AgentController:
     async def _act(self, device: DeviceSession, action: AgentAction, task: Task) -> None:
         from .. import observability as obs
         payload = action.model_dump(mode="json")
+        err = ""
         with obs.span("device.act", **{"device.kind": getattr(device, "kind", "phone"),
                                        "device.action": action.type.value}) as sp:
             for attempt in range(2):
@@ -662,6 +694,15 @@ class AgentController:
                     res = await device.request("act", action=payload)
                     if isinstance(res, dict) and res.get("ok") is False:
                         obs.set_attrs(sp, **{"device.act_error": str(res.get("error", ""))[:200]})
+                        if res.get("halt"):
+                            # The device's local kill switch: stop the task, no retries.
+                            task.cancel_requested = True
+                            task.log("note", f"stopped on the device: {res.get('error', '')}")
+                            audit(task.id, "kill_switch", str(res.get("error", ""))[:200])
+                        else:
+                            # Tell the model why (e.g. allowlist / workspace refusal).
+                            err = str(res.get("error") or "failed")[:120]
+                            task.log("note", f"action refused/failed: {err}")
                     break
                 except (RuntimeError, OSError, asyncio.TimeoutError):
                     obs.set_attrs(sp, **{"device.retried": True})
@@ -672,6 +713,8 @@ class AgentController:
                         raise
                     device = fresh
         label = self._action_label(action)
+        if err:
+            label += f" -> REFUSED: {err}"
         task.history.append(label)
         self.store.publish(task.id, "action", label, risk=action.risk_level)
         audit(task.id, "action", label, type=action.type.value, ref=action.ref)

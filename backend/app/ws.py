@@ -16,9 +16,15 @@ from fastapi import WebSocket
 log = logging.getLogger("agent.ws")
 
 
+def kind_of(device_id: str) -> str:
+    """Executor kind from the device id: desktop companions pair as `desktop-<host>`."""
+    return "desktop" if device_id.startswith("desktop-") else "phone"
+
+
 class DeviceSession:
     def __init__(self, device_id: str, socket: WebSocket):
         self.device_id = device_id
+        self.kind = kind_of(device_id)
         self.socket = socket
         self._rid = 0
         self._pending: dict[int, asyncio.Future] = {}

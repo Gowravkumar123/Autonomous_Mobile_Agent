@@ -347,7 +347,7 @@ def build_react_graph(controller):
         # reason about a near-blank screen. This is the #1 cause of the agent "asking
         # instead of acting" at the start. Capped so a non-launching app can't loop.
         opens = state.get("opens", 0)
-        if (task.executor not in ("browser", "api") and skill.app_packages
+        if (task.executor in ("", "mobile") and skill.app_packages
                 and screen.app_package not in skill.app_packages and opens < 2):
             name = _target_app_name(skill)
             task.log("action", "open_app", thought=f"Not in the target app; opening {name}.")
@@ -494,7 +494,8 @@ def build_react_graph(controller):
                 if decision.risk_level >= 4:
                     # User-only action (payment/auth): the user performs it; we re-observe.
                     resp = await device.request(
-                        "handoff", approval=c._approval_payload(task, decision, action, screen))
+                        "handoff", timeout=330.0,   # the user is paying/signing in (device waits 5 min)
+                        approval=c._approval_payload(task, decision, action, screen))
                     if isinstance(resp, dict) and resp.get("stop"):
                         # Executor can't let the user act in place (headless browser):
                         # stop here and tell them where to finish.

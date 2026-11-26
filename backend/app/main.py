@@ -322,8 +322,8 @@ async def create_task(body: CreateTask, p: Principal = Depends(principal)):
     # A device can only start tasks on itself; an admin may target any device.
     device_id = p.sub if p.scope == "device" else body.device_id
     executor = body.executor.strip().lower()
-    if executor not in ("auto", "mobile", "browser", "api", ""):
-        raise HTTPException(422, "executor must be auto, mobile, browser or api")
+    if executor not in ("auto", "mobile", "browser", "api", "desktop", ""):
+        raise HTTPException(422, "executor must be auto, mobile, browser, api or desktop")
     if body.start_url and not body.start_url.startswith(("http://", "https://")):
         raise HTTPException(422, "start_url must be an http(s) URL")
     task = Task(prompt=body.prompt, device_id=device_id, owner=p.sub,
@@ -522,7 +522,10 @@ async def ws_device(socket: WebSocket, device_id: str):
             mtype = msg.get("type")
             if mtype in ("approval_response", "answer"):
                 task = app.state.store.get(msg.get("task_id", ""))
-                if task is None or not _visible(p, task):
+                # The owner may answer — and so may the device the task is RUNNING on: the
+                # server pushed the prompt to that screen, for the person sitting at it
+                # (e.g. an admin-started task on a desktop). Nobody else can.
+                if task is None or not (_visible(p, task) or task.device_id == p.sub):
                     continue                  # can't answer someone else's task
                 if mtype == "approval_response":
                     controller.resolve_approval(task.id, bool(msg.get("approved")),

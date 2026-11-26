@@ -186,6 +186,10 @@ class AuthManager:
         device_id = (device_id or "").strip()
         if not device_id or len(device_id) > 80:
             raise AuthError("invalid device id")
+        # Server-side executors register as browser-<task>/api-<task>; a paired device
+        # claiming those ids could shadow a running task's session.
+        if device_id.startswith(("browser-", "api-")) or device_id == "admin":
+            raise AuthError("invalid device id (reserved prefix)")
         code = (code or "").strip()
         if not (len(code) == 6 and code.isdigit()) or \
                 await self.kv.getdel(self._code_key(code)) is None:
