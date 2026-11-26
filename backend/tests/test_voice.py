@@ -402,7 +402,7 @@ async def narration_unverified() -> None:
     ev = {"task_id": "t9", "kind": "state", "detail": "WAITING_FOR_USER",
           "data": {"summary": "[UNVERIFIED] The capital city of Australia is Canberra."}}
     line = s._narrate(ev)
-    check(line.startswith("I couldn't confirm this with a source, but:") and "Canberra" in line,
+    check(line.startswith("I couldn't fully verify this, but:") and "Canberra" in line,
           "unverified answer is spoken, honestly labelled")
     check(s._narrate(ev) == "", "...once (the state is emitted again)")
     s.task_id, s._final_spoken = "t10", ""

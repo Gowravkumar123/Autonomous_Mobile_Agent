@@ -499,7 +499,7 @@ class VoiceSession:
                 # the user must finish elsewhere). Say it, honestly labelled.
                 self._final_spoken = ev.get("task_id", "")
                 if summary.startswith("[UNVERIFIED]"):
-                    return ("I couldn't confirm this with a source, but: "
+                    return ("I couldn't fully verify this, but: "
                             + _clean_summary(summary))
                 return _clean_summary(summary)
             return ""

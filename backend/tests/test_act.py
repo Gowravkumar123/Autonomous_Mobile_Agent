@@ -89,8 +89,48 @@ def jwt_leeway() -> None:
     check(ok, "...but one 10 minutes in the future is still rejected")
 
 
+class BmsListPhone:
+    """BookMyShow's Now Showing list (the live movies check, 2026-11-26)."""
+    kind = "phone"
+    device_id = "p2"
+
+    async def request(self, type_, timeout=60.0, **data):
+        if type_ == "observe":
+            els = [{"ref": i, "role": "TextView", "text": t} for i, t in enumerate(
+                ["Now Showing", "Gunmaaster G9", "Bhogi", "ENE Repeat", "Ramayana"])]
+            return {"screen": {"app_package": "com.bt.bms", "activity": "list", "elements": els}}
+        return {"ok": True}
+
+    async def push(self, *a, **k): ...
+    def on_message(self, m): ...
+    def fail_all(self, e): ...
+
+
+async def answer_in_summary() -> None:
+    from app.agent.state import TaskState
+    devices = DeviceRegistry()
+    c = AgentController(LLMRouter(Settings(groq_api_key="", gemini_api_key="")),
+                        PolicyEngine(0), devices, TaskStore(), MemoryManager())
+    devices.add(BmsListPhone())                         # type: ignore[arg-type]
+    answer = "Now showing in Hyderabad: Gunmaaster G9, Bhogi, ENE Repeat, Ramayana."
+
+    async def decide(task, skill, screen, feedback=""):
+        return AgentAction(type=ActionType.DONE, text=answer, thought="list visible")
+    c._decide = decide
+    task = Task(prompt="which movies are showing in Hyderabad today?", device_id="p2",
+                executor="mobile", goal="List movies showing in Hyderabad today",
+                skill="generic", plan=["open BookMyShow", "read the list"])
+    c.store.create(task)
+    await asyncio.wait_for(c._execute_phase(task), 30)
+    check(answer in task.summary and task.summary.startswith(("[OK] ", "[UNVERIFIED] ")),
+          f"the agent's answer is the task result, honestly labelled ({task.state.value})")
+    check(task.state in (TaskState.COMPLETED, TaskState.WAITING_FOR_USER),
+          "read-only answer ends the task (no further steps)")
+
+
 async def main() -> None:
     await scroll_fallback()
+    await answer_in_summary()
     jwt_leeway()
     print(f"\nACT PASS  ({PASS} checks)")
 

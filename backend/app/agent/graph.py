@@ -399,7 +399,12 @@ def build_react_graph(controller):
                                else "model reported done without a successful tool result")
                 return {"status": "done" if verified else "waiting"}
             verified = is_success(screen, skill, task)
-            task.summary = c._summarize(task, success=verified)
+            answer = (action.text or "").strip()
+            # The model's answer IS the result for information goals ("which movies are
+            # showing?"). Live, it was dropped: the summary only restated the goal, so
+            # neither the app nor the voice ever told the user the movie list.
+            task.summary = (("[OK] " if verified else "[UNVERIFIED] ") + answer if answer
+                            else c._summarize(task, success=verified))
             task.set_state(TaskState.COMPLETED if verified else TaskState.WAITING_FOR_USER,
                            "model reported done" + ("" if verified else " (unverified — please confirm)"))
             return {"status": "done" if verified else "waiting"}
