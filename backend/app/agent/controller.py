@@ -648,6 +648,7 @@ class AgentController:
             from ..vision.ocr import available, ocr_items
             ocr = await asyncio.get_event_loop().run_in_executor(
                 None, ocr_items, screen.screenshot_b64)
+            screen.ocr_items = ocr          # the policy hit-tests tap_xy against these
             task.log("note", f"OCR: {'on' if available() else 'OFF'}, {len(ocr)} items, "
                              f"shot={'yes' if screen.screenshot_b64 else 'no'}, "
                              f"els={len(screen.elements)}")
@@ -696,6 +697,18 @@ class AgentController:
             for attempt in range(2):
                 try:
                     res = await device.request("act", action=payload)
+                    if (isinstance(res, dict) and res.get("ok") is False
+                            and action.type == ActionType.SCROLL and not res.get("halt")
+                            and getattr(device, "kind", "phone") == "phone"):
+                        # Phone scroll needs a scrollable node; custom-drawn screens (e.g.
+                        # BookMyShow's seat map) have none, so it failed in a loop live.
+                        # A swipe gesture works there: finger UP scrolls content DOWN.
+                        swipe = {"type": "swipe",
+                                 "direction": "down" if action.direction == "up" else "up"}
+                        res2 = await device.request("act", action=swipe)
+                        if isinstance(res2, dict) and res2.get("ok") is not False:
+                            task.log("note", "scroll had no scrollable view; used a swipe")
+                            res = res2
                     if isinstance(res, dict) and res.get("ok") is False:
                         obs.set_attrs(sp, **{"device.act_error": str(res.get("error", ""))[:200]})
                         if res.get("halt"):

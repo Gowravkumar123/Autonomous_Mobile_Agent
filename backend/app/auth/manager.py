@@ -96,7 +96,9 @@ class AuthManager:
         if not self.enabled:
             raise AuthError("auth disabled")
         try:
-            c = jwt.decode(token, self.secret, algorithms=[ALG], issuer=ISSUER,
+            # leeway: tokens minted on another machine (admin CLI, a second worker) were
+            # intermittently rejected as "not yet valid" over a ~1 s clock difference.
+            c = jwt.decode(token, self.secret, algorithms=[ALG], issuer=ISSUER, leeway=30,
                            options={"require": ["exp", "sub", "scope", "jti"]})
         except jwt.ExpiredSignatureError:
             raise AuthError("token expired")

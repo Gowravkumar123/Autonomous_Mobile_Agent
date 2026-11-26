@@ -65,6 +65,10 @@ class ScreenObservation(BaseModel):
     # Optional low-res screenshot (base64) for the vision fallback path.
     screenshot_b64: Optional[str] = None
     is_keyboard_open: bool = False
+    # Text read from the screenshot (OCR) for sparse screens: [{text, x, y, conf}], x/y =
+    # normalized box centre. Filled by the brain, NOT sent by the device; the policy uses
+    # it to see what a coordinate tap would hit.
+    ocr_items: list[dict] = Field(default_factory=list)
 
     def render_for_llm(self, limit: int = 120) -> str:
         head = f"App: {self.app_package or 'unknown'}  Screen: {self.activity or '?'}"
