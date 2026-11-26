@@ -43,6 +43,18 @@ RESUME = re.compile(r"^\W*(resume|continue|carry on|go on|keep going)\W*$", re.I
 STATUS = re.compile(r"\b(status|what are you doing|where are you|how('?s| is) it going|"
                     r"progress|what'?s happening)\b", re.I)
 _SENT = re.compile(r"(?<=[.!?])\s+")
+# "Zoro" as Whisper hears it on a phone mic (seen live: "Hi, Juro.").
+_NAMES = r"zoro|zorro|zoroo|zoru|juro|jurro|joro|jorro|soro|sorro|zolo|zaro|jaro|zuro"
+NAME_LEAD = re.compile(rf"^\W*(?:(?:hey|hi|hello|ok|okay|yo|oh)\W+)?(?:{_NAMES})\b[\s,.!?:;-]*",
+                       re.I)
+NAME_TAIL = re.compile(rf"[\s,]+(?:{_NAMES})\W*$", re.I)
+# Does an un-named utterance look like a request to an assistant (vs. people chatting)?
+REQUEST = re.compile(
+    r"\b(book|order|search|find|open|send|call|message|text|play|show|tell|check|buy|get|"
+    r"set|remind|compare|look up|read|write|schedule|navigate|reserve|pay|cancel|start|"
+    r"what|who|where|when|how|why|which|can you|could you|would you|will you|please|"
+    r"help|i want|i need|i'd like)\b", re.I)
+
 # Whisper's stock outputs for noise / silence / breathing (seen live on the phone).
 HALLUCINATIONS = {
     "thank you", "thanks", "thank you very much", "thank you so much", "thanks for watching",
@@ -57,12 +69,16 @@ class VoiceConfig:
     mode: str = "duplex"                 # duplex | ptt
     end_silence_ms: int = 700
     min_confidence: float = 0.35
-    task_confidence: float = 0.75        # below this a spoken NEW task is read back first
+    task_confidence: float = 0.55        # below this a spoken NEW task is read back first
     answer_confidence: float = 0.6       # below this an answer to Zoro's question is re-asked
     progress_every_s: float = 20.0       # spoken status while a task works (0 = off)
     partial_every_s: float = 0.0         # interim transcripts (costs STT calls; 0 = off)
     barge_in_bias_db: float = 6.0        # echo guard while the agent is talking
     language: str = ""
+    # Attention: Zoro reacts to un-named speech only right after it spoke (follow-ups) or
+    # when it is waiting for an answer; otherwise the speech must contain its name.
+    attention_after_reply_s: float = 8.0
+    attention_on_connect_s: float = 12.0
 
 
 @dataclass
@@ -108,6 +124,7 @@ class VoiceSession:
         self._final_spoken = ""
         self._recent_spoken: deque = deque(maxlen=6)   # echo filter
         self._start_overlapped = False
+        self._attention_until = 0.0
         self._last_partial = 0.0
         self._workers: list[asyncio.Task] = []
         self._events_q: asyncio.Queue | None = None
@@ -119,6 +136,7 @@ class VoiceSession:
     async def attach(self, transport) -> None:
         """(Re)connect a transport; the conversation (task, pending prompt) carries on."""
         self.transport = transport
+        self._open_attention(self.cfg.attention_on_connect_s)
         await self._send({"type": "ready", "session_id": self.id, "mode": self.cfg.mode,
                           "task_id": self.task_id, "pending": self.pending.kind,
                           "format": {"encoding": "pcm16le", "rate": 16000, "channels": 1,
@@ -198,7 +216,7 @@ class VoiceSession:
                 self._ptt = False
                 ev = self.vad.force_end()
                 if ev is not None and ev.kind == "end":
-                    await self._turns.put(("audio", ev.pcm, ev.speech_ms, False))
+                    await self._turns.put(("ptt", ev.pcm, ev.speech_ms, False))
         elif t == "text":                        # text fallback, same task state
             await self._turns.put(("text", str(msg.get("text", "")), 0, False))
         elif t == "playback":                    # client-side TTS state (fallback path)
@@ -238,11 +256,12 @@ class VoiceSession:
         while True:
             source, payload, speech_ms, overlapped = await self._turns.get()
             try:
-                if source == "audio":
+                if source in ("audio", "ptt"):
                     t0 = time.monotonic()
                     text, conf = await self.b.stt(pcm_to_wav(payload))
                     stt_ms = int((time.monotonic() - t0) * 1000)
-                    await self._handle_turn("voice", text, stt_ms, conf, speech_ms, overlapped)
+                    await self._handle_turn("voice", text, stt_ms, conf, speech_ms, overlapped,
+                                            addressed=(source == "ptt"))
                 else:
                     await self._handle_turn("text", payload, 0, 1.0, 0)
             except Exception:
@@ -250,7 +269,8 @@ class VoiceSession:
                 self.say("Sorry, something went wrong handling that.")
 
     async def _handle_turn(self, source: str, text: str, stt_ms: float, conf: float,
-                           speech_ms: int, overlapped: bool = False) -> str:
+                           speech_ms: int, overlapped: bool = False,
+                           addressed: bool = False) -> str:
         text = (text or "").strip()
         if source == "voice":
             await self._send({"type": "transcript", "final": True, "text": text,
@@ -258,7 +278,8 @@ class VoiceSession:
         turn = {"turn_id": uuid.uuid4().hex[:16], "session_id": self.id, "owner": self.owner,
                 "source": source, "transcript": text[:2000], "confidence": round(conf, 3),
                 "speech_ms": speech_ms, "stt_ms": int(stt_ms), "intent": "", "task_id": ""}
-        reply, intent = await self._route(text, conf, source, speech_ms, overlapped)
+        reply, intent = await self._route(text, conf, source, speech_ms, overlapped,
+                                          addressed)
         turn["intent"], turn["task_id"] = intent, self.task_id
         self.turns.append(turn)
         self.b.record_turn(turn)
@@ -288,14 +309,33 @@ class VoiceSession:
             return ("", "ignored_noise")
         return None
 
+    def _open_attention(self, seconds: float) -> None:
+        self._attention_until = max(self._attention_until, time.monotonic() + seconds)
+
+    def attention_open(self) -> bool:
+        return time.monotonic() < self._attention_until or self.pending.kind != ""
+
     async def _route(self, text: str, conf: float, source: str, speech_ms: int = 0,
-                     overlapped: bool = False) -> tuple[str, str]:
+                     overlapped: bool = False, addressed: bool = False) -> tuple[str, str]:
         if not text:
             return ("Sorry, I didn't catch that. Could you say it again, or type it?", "unclear")
+        named = False
         if source == "voice":
             gated = self._noise_gate(text, conf, speech_ms, overlapped)
             if gated is not None:
+                # Only ask "say that again?" when Zoro is actually listening to the user.
+                if gated[1] == "unclear" and not (addressed or self.attention_open()):
+                    return ("", "ignored_unaddressed")
                 return gated
+            text, named = _strip_name(text)
+            if not (addressed or named or self.attention_open()):
+                # Not talking to Zoro (people nearby, TV): stay silent.
+                return ("", "ignored_unaddressed")
+            if named and len(text.split()) < 2 and not (YES.match(text) or NO.match(text) or
+                                                         STOP.match(text) or STATUS.search(text)):
+                self._open_attention(self.cfg.attention_after_reply_s + 4)
+                return ("Yes? What would you like me to do?", "wake")
+        explicit = source != "voice" or addressed or named
         task = await self.b.lookup(self.task_id) if self.task_id else None
         state = task.state.value if task is not None else ""
         active = task is not None and state not in TERMINAL
@@ -358,8 +398,12 @@ class VoiceSession:
         if STOP.match(text) or PAUSE.match(text) or RESUME.match(text):
             return ("Nothing is running right now.", "idle_control")
         if active:
+            if not explicit:
+                return ("", "ignored_busy")      # chatter while a task runs: stay quiet
             return (f"I'm still working on: {task.goal or task.prompt}. Say stop to cancel "
                     "it first.", "busy")
+        if not explicit and (len(text.split()) < 3 or not REQUEST.search(text)):
+            return ("", "ignored_fragment")      # a follow-up must look like a request
         if source == "voice" and conf < self.cfg.task_confidence:
             self.pending = Pending("confirm_task", text=text)
             return (f"Did you want me to: {_short(text, 120)}? Say yes to start, or no.",
@@ -475,6 +519,8 @@ class VoiceSession:
             # Server TTS unavailable: the client speaks it (text fallback) and reports
             # playback so barge-in still works; estimate the duration meanwhile.
             self._client_playing_until = time.monotonic() + 0.4 + len(sentence.split()) / 2.6
+            self._attention_until = max(self._attention_until, self._client_playing_until
+                                        + self.cfg.attention_after_reply_s)
             await self._send({"type": "say", "text": sentence})
             return
         try:
@@ -497,6 +543,7 @@ class VoiceSession:
                 if ahead > 0.24:
                     await asyncio.sleep(ahead - 0.2)
             await self._send({"type": "speak_end"})
+            self._open_attention(self.cfg.attention_after_reply_s)
         finally:
             if gen == self._gen:
                 self._streaming = False
@@ -517,6 +564,18 @@ def _chunks(text: str, limit: int = 180) -> list[str]:
         if sent:
             out.append(sent)
     return out or [text]
+
+
+def _strip_name(text: str) -> tuple[str, bool]:
+    """Remove a leading/trailing "Zoro" (any of its mishearings); report if it was there."""
+    t = NAME_LEAD.sub("", text, count=1)
+    named = t != text
+    t2 = NAME_TAIL.sub("", t)
+    named = named or t2 != t
+    if not named:
+        return text, False
+    t2 = t2.strip()
+    return (t2[:1].upper() + t2[1:] if t2 else t2), True
 
 
 def _norm(s: str) -> str:

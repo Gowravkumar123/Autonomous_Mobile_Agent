@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     # Whisper language. Auto-detect ("") turned room noise into Arabic/Spanish/Italian
     # "speech" live on the phone; pin the user's language.
     voice_language: str = "en"
-    voice_task_confidence: float = 0.75  # spoken new tasks below this are read back first
+    voice_task_confidence: float = 0.55  # spoken new tasks below this are read back first
     voice_ice_servers: str = "stun:stun.l.google.com:19302"   # WebRTC (comma-separated)
 
     # Authentication. HMAC key for the signed admin/device tokens. EMPTY = auth DISABLED

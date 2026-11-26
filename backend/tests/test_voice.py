@@ -229,6 +229,7 @@ async def live_regression() -> None:
     b = Backend(create_task=create, lookup=lookup, ctl=ctl, subscribe=lambda: q,
                 unsubscribe=lambda _q: None, stt=fake_stt, tts=fake_tts)
     s = VoiceSession("reg", "phone", b)
+    s._open_attention(1000)          # these checks are about the noise/read-back rules
 
     task["t"] = _FakeTask()
     s.task_id, s.pending = "t1", Pending("ask", "t1")
@@ -243,9 +244,13 @@ async def live_regression() -> None:
           "long unintelligible speech -> one 'didn't catch' (not silence)")
 
     task["t"], s.task_id, s.pending = None, "", Pending()
+    s.cfg.task_confidence = 0.75     # (the first session's threshold)
     reply, intent = await s._route("come il professor Fondi Si", 0.43, "voice", 1400)
+    check(not created and intent == "ignored_fragment" and not reply,
+          "the live phantom task is no longer started (not even read back: not a request)")
+    reply, intent = await s._route("please open the settings app", 0.43, "voice", 1400)
     check(not created and intent == "confirm_task" and "Say yes to start" in reply,
-          "the live phantom task is now READ BACK instead of started")
+          "a low-confidence real-looking request is READ BACK instead of started")
     reply, intent = await s._route("no", 0.9, "voice", 500)
     check(not created and intent == "confirm_rejected", "...and 'no' drops it")
     await s._route("open whatsapp and message amma", 0.6, "voice", 1600)
@@ -267,6 +272,93 @@ async def live_regression() -> None:
     check(intent == "answer" and answered, "a real answer still gets through")
     _, intent = await s._route("hmm maybe", 0.5, "voice", 900, overlapped=True)
     check(intent == "ignored_echo", "low-confidence speech that began over Zoro's voice is ignored")
+    await s.close()
+
+
+# The second live phone session (2026-11-26 15:05): the user asked once, then people
+# talked nearby. Before addressing, ~10 of these got "Did you want me to ...?" read-backs.
+SESSION2 = [
+    ("Bye.", 0.139, 400), ("What's that?", 0.59, 580), ("I don't know.", 0.386, 920),
+    ("I'll have another one.", 0.08, 620), ("Thank you.", 0.273, 380),
+    ("What is that?", 0.496, 2140), ("Wow, I got a... action candy.", 0.357, 1740),
+    ("That's nice.", 0.353, 3800), ("Thank you.", 0.399, 580), ("No.", 0.402, 500),
+    ("You can't have that.", 0.352, 680), ("Amen.", 0.356, 1660), ("Thank you.", 0.432, 280),
+    ("Take care.", 0.437, 600), ("and i'm not very much", 0.489, 780),
+    ("Nothing will happen.", 0.541, 520), ("Thank you.", 0.219, 280),
+    ("Thank you.", 0.542, 460), ("Hi, I'm going to turn it off.", 0.541, 1700),
+    ("Bye.", 0.126, 380), ("Bye.", 0.31, 380),
+    ("I think I found a question. I think I found a question.", 0.23, 2740),
+    ("We will sit down and keep sitting for 10 minutes.", 0.434, 1780),
+    ("And this kind of...", 0.653, 1160)]
+
+
+async def addressing_regression() -> None:
+    from app.voice.session import Backend, Pending, VoiceSession
+    created, answered, ctls = [], [], []
+    task = {"t": None}
+
+    async def lookup(_):
+        return task["t"]
+
+    async def ctl(task_id, op, **a):
+        ctls.append(op)
+        if op == "resolve_answer":
+            answered.append(a["facts"])
+        return True
+
+    async def create(text):
+        created.append(text)
+        return "t-new"
+    q: asyncio.Queue = asyncio.Queue()
+    b = Backend(create_task=create, lookup=lookup, ctl=ctl, subscribe=lambda: q,
+                unsubscribe=lambda _q: None, stt=fake_stt, tts=fake_tts)
+    s = VoiceSession("addr", "phone", b)
+    s._attention_until = 0.0                                   # nobody has spoken lately
+
+    reply, intent = await s._route("Hi, Juro. Can you say what is the capital of Australia?",
+                                   0.594, "voice", 2600)
+    check(intent == "new_task" and created == ["Can you say what is the capital of Australia?"],
+          "the live request ('Hi, Juro...') starts at once: name heard, 0.59 >= 0.55")
+    task["t"], s.task_id = _FakeTask(), "t-new"                 # it's running now
+    s._attention_until = 0.0
+    replies = [await s._route(t, c, "voice", ms) for t, c, ms in SESSION2]
+    spoken = [r for r, _ in replies if r]
+    check(not spoken and len(created) == 1 and not ctls,
+          f"all {len(SESSION2)} background turns from the live session stay silent "
+          f"({sorted({i for _, i in replies})})")
+
+    task["t"], s.task_id = None, ""                             # task finished
+    s._open_attention(8)                                        # Zoro just answered
+    for t in ("I don't know.", "Take care.", "That's nice."):
+        _, intent = await s._route(t, 0.7, "voice", 900)
+        check(intent == "ignored_fragment", f"follow-up window: chatter '{t}' isn't a request")
+    reply, intent = await s._route("And what about New Zealand?", 0.8, "voice", 1500)
+    check(intent == "new_task" and created[-1] == "And what about New Zealand?",
+          "follow-up window: a real follow-up question works without the name")
+
+    task["t"], s.task_id = _FakeTask(), "t-new"
+    s._open_attention(8)
+    _, intent = await s._route("Book me a cab to the airport", 0.8, "voice", 1500)
+    check(intent == "ignored_busy", "while a task runs, un-named requests don't interrupt it")
+    reply, intent = await s._route("Zoro, book me a cab", 0.8, "voice", 1500)
+    check(intent == "busy" and "still working" in reply, "...named ones get the busy answer")
+    _, intent = await s._route("Zoro stop", 0.8, "voice", 800)
+    check(intent == "cancel" and "cancel" in ctls, "'Zoro, stop' cancels the running task")
+
+    task["t"], s.task_id = None, ""
+    s._attention_until = 0.0
+    reply, intent = await s._route("Hey Zoro", 0.8, "voice", 700)
+    check(intent == "wake" and s.attention_open(), "'Hey Zoro' alone -> 'Yes?' and listens")
+    _, intent = await s._route("search the weather in Hyderabad", 0.8, "voice", 1600)
+    check(intent == "new_task", "...then the request needs no name")
+    s._attention_until, s.pending = 0.0, Pending()
+    _, intent = await s._route("book a cab", 0.9, "voice", 900, addressed=True)
+    check(intent == "new_task", "push-to-talk turns are addressed by the button press")
+    s._attention_until = 0.0
+    s.pending = Pending("ask", "t-x")
+    task["t"], s.task_id = _FakeTask(), "t-x"
+    _, intent = await s._route("AC three tier", 0.8, "voice", 1200)
+    check(intent == "answer", "a pending question keeps Zoro listening (answer needs no name)")
     await s.close()
 
 
@@ -526,6 +618,7 @@ async def webrtc_check() -> None:
 async def main() -> None:
     unit_audio()
     await live_regression()
+    await addressing_regression()
     await e2e()
     await webrtc_check()
     print(f"\nVOICE PASS  ({PASS} checks)")
