@@ -174,9 +174,9 @@ class Client:
             if realtime:
                 await asyncio.sleep(0.02)
 
-    async def say(self, text: str, conf: float = 0.92):
+    async def say(self, text: str, conf: float = 0.92, ms: int = 600):
         SCRIPT.append((text, conf))
-        await self.talk(noise(200) + speech(600) + noise(900, seed=3))
+        await self.talk(noise(200) + speech(ms) + noise(900, seed=3))
 
     def said(self) -> list[str]:
         return [e["text"] for e in self.events if e.get("type") == "speak"]
@@ -198,6 +198,76 @@ def free_port() -> int:
     with socket.socket() as so:
         so.bind(("127.0.0.1", 0))
         return so.getsockname()[1]
+
+
+class _FakeTask:
+    def __init__(self, state="RUNNING"):
+        self.state = TaskState(state)
+        self.goal = self.prompt = "book a train"
+        self.history, self.summary, self.error = [], "", ""
+
+
+async def live_regression() -> None:
+    """Replay the exact turns the phone produced on 2026-11-26 (room noise + Zoro's own
+    voice): before the fix, noise answered a question and STARTED A TASK on the phone."""
+    from app.voice.session import Backend, Pending, VoiceSession
+    created, answered = [], []
+    task = {"t": None}
+
+    async def lookup(_):
+        return task["t"]
+
+    async def ctl(task_id, op, **a):
+        if op == "resolve_answer":
+            answered.append(a["facts"])
+        return True
+
+    async def create(text):
+        created.append(text)
+        return "t-new"
+    q: asyncio.Queue = asyncio.Queue()
+    b = Backend(create_task=create, lookup=lookup, ctl=ctl, subscribe=lambda: q,
+                unsubscribe=lambda _q: None, stt=fake_stt, tts=fake_tts)
+    s = VoiceSession("reg", "phone", b)
+
+    task["t"] = _FakeTask()
+    s.task_id, s.pending = "t1", Pending("ask", "t1")
+    live = [("Amen.", 0.40, 400), ("Awesome.", 0.22, 740), ("Valeu, gente.", 0.16, 880),
+            ("\u0634\u0643\u0631\u0627", 0.56, 660), ("Thank you.", 0.10, 560),
+            ("Thank you.", 0.51, 600)]
+    intents = [(await s._route(t, c, "voice", ms))[1] for t, c, ms in live]
+    check(not answered and all(i in ("ignored_noise", "unclear") for i in intents),
+          f"live noise turns can't answer Zoro's question ({intents})")
+    reply, intent = await s._route("Yo creo que no tengo que contestar.", 0.30, "voice", 2440)
+    check(intent == "unclear" and "didn't catch" in reply,
+          "long unintelligible speech -> one 'didn't catch' (not silence)")
+
+    task["t"], s.task_id, s.pending = None, "", Pending()
+    reply, intent = await s._route("come il professor Fondi Si", 0.43, "voice", 1400)
+    check(not created and intent == "confirm_task" and "Say yes to start" in reply,
+          "the live phantom task is now READ BACK instead of started")
+    reply, intent = await s._route("no", 0.9, "voice", 500)
+    check(not created and intent == "confirm_rejected", "...and 'no' drops it")
+    await s._route("open whatsapp and message amma", 0.6, "voice", 1600)
+    reply, intent = await s._route("yes", 0.9, "voice", 500)
+    check(created == ["open whatsapp and message amma"] and intent == "new_task",
+          "a read-back request starts only after an explicit yes")
+    created.clear()
+    s.task_id, task["t"] = "", None
+    await s._route("search the web for the weather in Hyderabad", 0.9, "voice", 2200)
+    check(created == ["search the web for the weather in Hyderabad"],
+          "clearly heard requests start immediately")
+
+    s._recent_spoken.append("the capital of australia is canberra")
+    task["t"] = _FakeTask()
+    s.task_id, s.pending = "t2", Pending("ask", "t2")
+    _, intent = await s._route("The capital of Australia is Canberra.", 0.9, "voice", 2000)
+    check(intent == "ignored_echo" and not answered, "Zoro's own voice in the mic is ignored")
+    _, intent = await s._route("AC three tier please", 0.9, "voice", 1500, overlapped=False)
+    check(intent == "answer" and answered, "a real answer still gets through")
+    _, intent = await s._route("hmm maybe", 0.5, "voice", 900, overlapped=True)
+    check(intent == "ignored_echo", "low-confidence speech that began over Zoro's voice is ignored")
+    await s.close()
 
 
 async def e2e() -> None:
@@ -288,9 +358,13 @@ async def e2e() -> None:
                   "...exactly once (final state is emitted twice)")
 
             # ---- low confidence -> ask to repeat ----
-            await c.say("mumble", conf=0.1)
+            # Wait until Zoro has finished talking (speech that starts over Zoro's voice
+            # is treated as possible echo).
+            await c.wait(lambda: not app.state.voice.sessions["s1"].agent_speaking, 10)
+            await asyncio.sleep(0.3)
+            await c.say("mumble mumble something", conf=0.1, ms=1400)
             check(await c.wait(lambda: any("didn't catch that" in t for t in c.said())),
-                  "low-confidence transcript -> asks to repeat (no action)")
+                  "low-confidence real speech -> asks to repeat (no action)")
 
             # ---- barge-in ----
             TTS_LONG["on"] = True
@@ -451,6 +525,7 @@ async def webrtc_check() -> None:
 
 async def main() -> None:
     unit_audio()
+    await live_regression()
     await e2e()
     await webrtc_check()
     print(f"\nVOICE PASS  ({PASS} checks)")

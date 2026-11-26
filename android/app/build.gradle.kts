@@ -16,8 +16,11 @@ android {
 
         // Points at the on-prem backend. The phone must be on a network that can
         // route to this IP. (Emulator-to-host would be 10.0.2.2 instead.)
-        buildConfigField("String", "BACKEND_WS_URL", "\"ws://37.27.53.14:8033\"")
-        buildConfigField("String", "BACKEND_HTTP_URL", "\"http://37.27.53.14:8033\"")
+        // Override for testing against a local backend (e.g. via `adb reverse tcp:8033
+        // tcp:8033`):  gradle assembleDebug -PbackendHost=127.0.0.1:8033
+        val backendHost = (project.findProperty("backendHost") as String?) ?: "37.27.53.14:8033"
+        buildConfigField("String", "BACKEND_WS_URL", "\"ws://$backendHost\"")
+        buildConfigField("String", "BACKEND_HTTP_URL", "\"http://$backendHost\"")
     }
 
     buildFeatures {

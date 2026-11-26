@@ -21,6 +21,7 @@ import logging
 import re
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -42,6 +43,12 @@ RESUME = re.compile(r"^\W*(resume|continue|carry on|go on|keep going)\W*$", re.I
 STATUS = re.compile(r"\b(status|what are you doing|where are you|how('?s| is) it going|"
                     r"progress|what'?s happening)\b", re.I)
 _SENT = re.compile(r"(?<=[.!?])\s+")
+# Whisper's stock outputs for noise / silence / breathing (seen live on the phone).
+HALLUCINATIONS = {
+    "thank you", "thanks", "thank you very much", "thank you so much", "thanks for watching",
+    "thank you for watching", "please subscribe", "amen", "bye", "bye bye", "you", "oh", "uh",
+    "um", "hmm", "mm", "ah", "okay okay", "so", "the end", "subtitles by the amaraorg community",
+}
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 
 
@@ -50,6 +57,8 @@ class VoiceConfig:
     mode: str = "duplex"                 # duplex | ptt
     end_silence_ms: int = 700
     min_confidence: float = 0.35
+    task_confidence: float = 0.75        # below this a spoken NEW task is read back first
+    answer_confidence: float = 0.6       # below this an answer to Zoro's question is re-asked
     progress_every_s: float = 20.0       # spoken status while a task works (0 = off)
     partial_every_s: float = 0.0         # interim transcripts (costs STT calls; 0 = off)
     barge_in_bias_db: float = 6.0        # echo guard while the agent is talking
@@ -75,6 +84,7 @@ class Pending:
     task_id: str = ""
     approval_id: str = ""
     risk: int = 0
+    text: str = ""                       # confirm_task: what we'd start
 
 
 class VoiceSession:
@@ -96,6 +106,8 @@ class VoiceSession:
         self._ptt = False
         self._last_progress = 0.0
         self._final_spoken = ""
+        self._recent_spoken: deque = deque(maxlen=6)   # echo filter
+        self._start_overlapped = False
         self._last_partial = 0.0
         self._workers: list[asyncio.Task] = []
         self._events_q: asyncio.Queue | None = None
@@ -163,12 +175,13 @@ class VoiceSession:
             return
         if ev.kind == "start":
             self._last_partial = time.monotonic()
+            self._start_overlapped = self.agent_speaking
             if self.agent_speaking:
                 await self.barge_in()
             await self._send({"type": "vad", "state": "speech"})
         elif ev.kind == "end":
             await self._send({"type": "vad", "state": "end", "speech_ms": ev.speech_ms})
-            await self._turns.put(("audio", ev.pcm, ev.speech_ms))
+            await self._turns.put(("audio", ev.pcm, ev.speech_ms, self._start_overlapped))
         elif ev.kind == "discard":
             await self._send({"type": "vad", "state": "discard"})
 
@@ -185,9 +198,9 @@ class VoiceSession:
                 self._ptt = False
                 ev = self.vad.force_end()
                 if ev is not None and ev.kind == "end":
-                    await self._turns.put(("audio", ev.pcm, ev.speech_ms))
+                    await self._turns.put(("audio", ev.pcm, ev.speech_ms, False))
         elif t == "text":                        # text fallback, same task state
-            await self._turns.put(("text", str(msg.get("text", "")), 0))
+            await self._turns.put(("text", str(msg.get("text", "")), 0, False))
         elif t == "playback":                    # client-side TTS state (fallback path)
             if msg.get("state") == "start":
                 self._client_playing_until = time.monotonic() + float(msg.get("ms", 8000)) / 1000
@@ -223,13 +236,13 @@ class VoiceSession:
 
     async def _turn_loop(self) -> None:
         while True:
-            source, payload, speech_ms = await self._turns.get()
+            source, payload, speech_ms, overlapped = await self._turns.get()
             try:
                 if source == "audio":
                     t0 = time.monotonic()
                     text, conf = await self.b.stt(pcm_to_wav(payload))
                     stt_ms = int((time.monotonic() - t0) * 1000)
-                    await self._handle_turn("voice", text, stt_ms, conf, speech_ms)
+                    await self._handle_turn("voice", text, stt_ms, conf, speech_ms, overlapped)
                 else:
                     await self._handle_turn("text", payload, 0, 1.0, 0)
             except Exception:
@@ -237,7 +250,7 @@ class VoiceSession:
                 self.say("Sorry, something went wrong handling that.")
 
     async def _handle_turn(self, source: str, text: str, stt_ms: float, conf: float,
-                           speech_ms: int) -> str:
+                           speech_ms: int, overlapped: bool = False) -> str:
         text = (text or "").strip()
         if source == "voice":
             await self._send({"type": "transcript", "final": True, "text": text,
@@ -245,7 +258,7 @@ class VoiceSession:
         turn = {"turn_id": uuid.uuid4().hex[:16], "session_id": self.id, "owner": self.owner,
                 "source": source, "transcript": text[:2000], "confidence": round(conf, 3),
                 "speech_ms": speech_ms, "stt_ms": int(stt_ms), "intent": "", "task_id": ""}
-        reply, intent = await self._route(text, conf, source)
+        reply, intent = await self._route(text, conf, source, speech_ms, overlapped)
         turn["intent"], turn["task_id"] = intent, self.task_id
         self.turns.append(turn)
         self.b.record_turn(turn)
@@ -253,14 +266,49 @@ class VoiceSession:
             self.say(reply)
         return reply
 
-    async def _route(self, text: str, conf: float, source: str) -> tuple[str, str]:
-        if not text or (source == "voice" and conf < self.cfg.min_confidence):
+    def _noise_gate(self, text: str, conf: float, speech_ms: int,
+                    overlapped: bool) -> tuple[str, str] | None:
+        """Drop what isn't the user talking to Zoro: room noise, Whisper's stock
+        hallucinations, and Zoro's own voice leaking back into the mic. Dropped SILENTLY —
+        a "sorry?" reply would itself be picked up and loop."""
+        norm = _norm(text)
+        if not norm:
+            return ("", "ignored_noise")
+        if any(norm == r or (len(norm) >= 8 and norm in r) for r in self._recent_spoken):
+            return ("", "ignored_echo")
+        if norm in HALLUCINATIONS and speech_ms < 1500:
+            return ("", "ignored_noise")
+        if overlapped and conf < 0.6:
+            return ("", "ignored_echo")
+        if conf < self.cfg.min_confidence:
+            if speech_ms >= 1200:          # real speech we couldn't make out: ask
+                return ("Sorry, I didn't catch that. Could you say it again?", "unclear")
+            return ("", "ignored_noise")
+        if speech_ms < 600 and conf < 0.6:
+            return ("", "ignored_noise")
+        return None
+
+    async def _route(self, text: str, conf: float, source: str, speech_ms: int = 0,
+                     overlapped: bool = False) -> tuple[str, str]:
+        if not text:
             return ("Sorry, I didn't catch that. Could you say it again, or type it?", "unclear")
+        if source == "voice":
+            gated = self._noise_gate(text, conf, speech_ms, overlapped)
+            if gated is not None:
+                return gated
         task = await self.b.lookup(self.task_id) if self.task_id else None
         state = task.state.value if task is not None else ""
         active = task is not None and state not in TERMINAL
 
         p = self.pending
+        if p.kind == "confirm_task":
+            # We read a low-confidence request back; only an explicit yes starts it.
+            self.pending = Pending()
+            if YES.match(text):
+                return await self._start(p.text)
+            if NO.match(text) or STOP.match(text):
+                return ("Okay, never mind.", "confirm_rejected")
+            # Anything else is a fresh request: fall through and route it normally.
         if active and p.kind == "approval":
             if YES.match(text):
                 if p.risk >= 4:
@@ -289,6 +337,8 @@ class VoiceSession:
             self.pending = Pending()
             return ("Okay, stopping.", "cancel")
         if active and p.kind == "ask":
+            if source == "voice" and conf < self.cfg.answer_confidence:
+                return ("Sorry, I didn't catch your answer. Could you say it again?", "unclear")
             # The question event can reach us a moment before the task starts waiting.
             for _ in range(20):
                 if await self.b.ctl(self.task_id, "resolve_answer",
@@ -310,6 +360,13 @@ class VoiceSession:
         if active:
             return (f"I'm still working on: {task.goal or task.prompt}. Say stop to cancel "
                     "it first.", "busy")
+        if source == "voice" and conf < self.cfg.task_confidence:
+            self.pending = Pending("confirm_task", text=text)
+            return (f"Did you want me to: {_short(text, 120)}? Say yes to start, or no.",
+                    "confirm_task")
+        return await self._start(text)
+
+    async def _start(self, text: str) -> tuple[str, str]:
         self.task_id = await self.b.create_task(text)
         self.pending = Pending()
         self._last_progress = time.monotonic()
@@ -412,6 +469,7 @@ class VoiceSession:
                 nxt.cancel()
 
     async def _play(self, gen: int, sentence: str, audio: bytes | None) -> None:
+        self._recent_spoken.append(_norm(sentence))
         await self._send({"type": "speak", "text": sentence, "audio": bool(audio)})
         if not audio:
             # Server TTS unavailable: the client speaks it (text fallback) and reports
@@ -459,6 +517,10 @@ def _chunks(text: str, limit: int = 180) -> list[str]:
         if sent:
             out.append(sent)
     return out or [text]
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", (s or "").lower())).strip()
 
 
 def _short(s: str, n: int = 140) -> str:

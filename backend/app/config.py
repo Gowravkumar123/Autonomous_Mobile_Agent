@@ -75,7 +75,10 @@ class Settings(BaseSettings):
     voice_min_confidence: float = 0.35   # below this, ask the user to repeat
     voice_progress_s: float = 20.0       # spoken progress updates while a task works
     voice_partial_s: float = 0.0         # interim transcripts every N s (extra STT cost)
-    voice_language: str = ""             # e.g. "en"; "" = auto-detect
+    # Whisper language. Auto-detect ("") turned room noise into Arabic/Spanish/Italian
+    # "speech" live on the phone; pin the user's language.
+    voice_language: str = "en"
+    voice_task_confidence: float = 0.75  # spoken new tasks below this are read back first
     voice_ice_servers: str = "stun:stun.l.google.com:19302"   # WebRTC (comma-separated)
 
     # Authentication. HMAC key for the signed admin/device tokens. EMPTY = auth DISABLED

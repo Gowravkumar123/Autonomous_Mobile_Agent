@@ -133,7 +133,15 @@ class AgentForegroundService : Service() {
                 main.post {
                     Log.i(TAG, "conversation: $state")
                     if (state == "live") status = "Listening - just talk (interrupt any time)"
-                    if (state.startsWith("error")) status = "Voice: " + state.removePrefix("error:")
+                    if (state.startsWith("error")) {
+                        status = "Voice: " + state.removePrefix("error:")
+                        // Visible even when notifications are off.
+                        android.widget.Toast.makeText(this@AgentForegroundService,
+                            "Talk failed: " + state.removePrefix("error:"),
+                            android.widget.Toast.LENGTH_LONG).show()
+                    }
+                    if (state == "live") android.widget.Toast.makeText(this@AgentForegroundService,
+                        "Zoro is listening - just talk", android.widget.Toast.LENGTH_SHORT).show()
                     if (state == "closed" || state.startsWith("error")) {
                         main.removeCallbacks(idleCheck)
                         conversation = null

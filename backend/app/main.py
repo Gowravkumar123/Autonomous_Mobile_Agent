@@ -629,6 +629,7 @@ def _voice_cfg(mode: str):
     return VoiceConfig(mode=mode if mode in ("duplex", "ptt") else "duplex",
                        end_silence_ms=s.voice_end_silence_ms,
                        min_confidence=s.voice_min_confidence,
+                       task_confidence=s.voice_task_confidence,
                        progress_every_s=s.voice_progress_s,
                        partial_every_s=s.voice_partial_s, language=s.voice_language)
 
