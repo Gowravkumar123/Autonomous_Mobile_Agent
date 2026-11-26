@@ -93,7 +93,9 @@ async def lifespan(app: FastAPI):
     app.state.controller.kv = app.state.kv
     # Multi-worker routing (device sockets / task control / events) over the same Redis.
     from .cluster import make_cluster
-    app.state.cluster = make_cluster(s.redis_url, s.cluster_enabled)
+    # Only route through Redis if it actually answered (make_kv falls back to memory).
+    app.state.cluster = make_cluster(s.redis_url if app.state.kv.name == "redis" else "",
+                                     s.cluster_enabled)
     app.state.store.cluster = app.state.cluster
     app.state.controller.cluster = app.state.cluster
 
