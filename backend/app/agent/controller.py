@@ -373,6 +373,13 @@ class AgentController:
         from ..policy.engine import PolicyDecision
         from ..tools.base import APPROVE, DENY, ToolError
         name, args = (action.tool or "").strip(), dict(action.args or {})
+        # Live: the model sometimes nests the call — tool="call_tool",
+        # args={"tool": "web.fetch", "args": {...}}. Unwrap it (the inner call still goes
+        # through every check below: lookup, policy, schema, approval).
+        if name == "call_tool" and isinstance(args.get("tool"), str):
+            name = args["tool"].strip()
+            args = dict(args.get("args") or {}) if isinstance(args.get("args"), dict) else {}
+            action = action.model_copy(update={"tool": name, "args": args})
         spec = self.tools.get(name) if self.tools is not None else None
 
         def record(ok: bool, text: str, *, cached: bool = False, error: str = "",

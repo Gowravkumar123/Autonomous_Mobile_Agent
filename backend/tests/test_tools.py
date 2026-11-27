@@ -186,6 +186,25 @@ async def agent_tests():
           and all(r["ok"] for r in t.tool_results) and len(t.tool_results) == 2,
           "API executor: tool results -> verified answer (COMPLETED)")
 
+    # 1b. live quirk (server, 2026-11-27): the model nested the call inside "call_tool"
+    c, store = make([AgentAction(type=ActionType.CALL_TOOL, tool="call_tool",
+                                 args={"tool": "local.add", "args": {"a": 2, "b": 3}}),
+                     AgentAction(type=ActionType.DONE, text="2+3=5")])
+    t = await run(c, store, Task(prompt="sum", executor="api", owner="admin", goal="sum",
+                                 skill="generic"))
+    check(t.tool_results and t.tool_results[0]["tool"] == "local.add" and
+          t.tool_results[0]["ok"] and t.state == TaskState.COMPLETED,
+          "nested call_tool{'tool','args'} is unwrapped to the real tool")
+    n_before = await notes()
+    c, store = make([AgentAction(type=ActionType.CALL_TOOL, tool="call_tool",
+                                 args={"tool": "local.create_note",
+                                       "args": {"title": "x", "body": "y"}}),
+                     AgentAction(type=ActionType.DONE, text="saved")])
+    t = await run(c, store, Task(prompt="note", executor="api", owner="admin", goal="note",
+                                 skill="generic"), approve=False)
+    check(await notes() == n_before and c.approvals_for(t.id),
+          "...and the unwrapped call still needs approval (declined -> not executed)")
+
     # 2. write tool -> transaction-bound approval -> executes
     n0 = await notes()
     c, store = make([tool("local.create_note", title="Trip", body="sunny"),
